@@ -25,13 +25,15 @@ CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -g \
 override CFLAGS += -I../include -I../src/input
 
 # Replace the parent's broken -L. with -L.. so -lishizue resolves.
-# --allow-shlib-undefined: the .so carries sibling-wave externs
-# (isz_backend_blank_all_crtcs, isz_render_send_presented,
-# isz_render_send_capture_done) that are not yet defined. They are
-# never called on the headless path this test exercises, so allowing
-# them to stay unresolved at link time is safe. The flag becomes a
-# no-op once those waves land.
+# If the parent passes LDFLAGS pointing at a test-build dir (e.g.
+# ../build-test), honor it; otherwise default to -L..
+ifeq ($(LDFLAGS),)
 override LDFLAGS := -L.. -lishizue -Wl,--allow-shlib-undefined
+endif
+
+# rpath for the test binary so we don't need LD_LIBRARY_PATH at run time
+# (already set by parent when present)
+RUN_LDFLAGS = $(LDFLAGS)
 
 TESTS = test_headless_basic
 
@@ -44,13 +46,16 @@ all: $(TESTS)
 test_headless_basic: test_headless_basic.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-# Run every test under LD_LIBRARY_PATH=.. so the dynamic linker finds
-# ../libishizue.so.1. `set -e` propagates the first failure to make.
+# Run every test. Honor the LDFLAGS-derived library path if the parent
+# passed one (e.g. -L../build-test); fall back to the parent dir.
+# `set -e` propagates the first failure to make.
 run: $(TESTS)
 	@set -e; \
+	libdir=$$(echo "$(LDFLAGS)" | sed -n 's/.*-L\([^ ]*\).*/\1/p'); \
+	[ -z "$$libdir" ] && libdir=..; \
 	for t in $(TESTS); do \
 	        echo "--- running $$t ---"; \
-	        LD_LIBRARY_PATH=..:$$LD_LIBRARY_PATH ./$$t; \
+	        LD_LIBRARY_PATH=$$libdir:$$LD_LIBRARY_PATH ./$$t; \
 	done
 
 clean:

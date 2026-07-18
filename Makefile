@@ -21,18 +21,18 @@ ENABLE_HEADLESS    ?= 1
 CC      ?= cc
 AR      ?= ar
 CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g \
-           -fvisibility=hidden -fPIC \
-           -DISZ_MAX_SURFACES_PER_CLIENT=$(ISZ_MAX_SURFACES_PER_CLIENT) \
-           -DISZ_MAX_CLIENTS=$(ISZ_MAX_CLIENTS) \
-           -DISZ_MAX_DMABUF_IMPORTS_TOTAL=$(ISZ_MAX_DMABUF_IMPORTS_TOTAL) \
-           -DISZ_THREAD_POOL_SIZE=$(ISZ_THREAD_POOL_SIZE) \
-           -DISZ_MAX_EVENTS_PER_CLIENT=$(ISZ_MAX_EVENTS_PER_CLIENT) \
-           -DENABLE_HDR=$(ENABLE_HDR) \
-           -DENABLE_VRR=$(ENABLE_VRR) \
-           -DENABLE_THREAD_POOL=$(ENABLE_THREAD_POOL) \
-           -DENABLE_HEADLESS=$(ENABLE_HEADLESS)
+	   -fvisibility=hidden -fPIC \
+	   -DISZ_MAX_SURFACES_PER_CLIENT=$(ISZ_MAX_SURFACES_PER_CLIENT) \
+	   -DISZ_MAX_CLIENTS=$(ISZ_MAX_CLIENTS) \
+	   -DISZ_MAX_DMABUF_IMPORTS_TOTAL=$(ISZ_MAX_DMABUF_IMPORTS_TOTAL) \
+	   -DISZ_THREAD_POOL_SIZE=$(ISZ_THREAD_POOL_SIZE) \
+	   -DISZ_MAX_EVENTS_PER_CLIENT=$(ISZ_MAX_EVENTS_PER_CLIENT) \
+	   -DENABLE_HDR=$(ENABLE_HDR) \
+	   -DENABLE_VRR=$(ENABLE_VRR) \
+	   -DENABLE_THREAD_POOL=$(ENABLE_THREAD_POOL) \
+	   -DENABLE_HEADLESS=$(ENABLE_HEADLESS)
 LDFLAGS ?= -shared -Wl,--version-script=libishizue.map \
-           -Wl,-soname,libishizue.so.$(shell sed -n 's/.*VERSION_MAJOR *\([0-9]*\).*/\1/p' include/ishizue/version.h)
+	   -Wl,-soname,libishizue.so.$(shell sed -n 's/.*VERSION_MAJOR *\([0-9]*\).*/\1/p' include/ishizue/version.h)
 
 PKG_DEPS = libdrm libinput libseat xkbcommon
 
@@ -73,9 +73,41 @@ $(LIB_LINK): $(LIB_SONAME)
 %.o: %.c $(HDRS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-test check: CFLAGS += -DISHIZUE_ENABLE_TEST_HOOKS -g3 -O0
-test check: all
-	@$(MAKE) -C tests CFLAGS="$(CFLAGS)" LDFLAGS="-L. -lishizue" run
+# Tests need the library rebuilt with -DISHIZUE_ENABLE_TEST_HOOKS so the
+# isz_test_* symbols are present. Use a separate build dir to avoid
+# clobbering the release .o files.
+TEST_BUILD_DIR := build-test
+
+test check:
+	@mkdir -p $(TEST_BUILD_DIR)
+	@find src -name '*.c' | while read f; do \
+	    obj=$$(echo "$$f" | sed 's|^src/|$(TEST_BUILD_DIR)/|;s|\.c$$|.o|'); \
+	    mkdir -p "$$(dirname "$$obj")"; \
+	    $(CC) -std=c11 -Wall -Wextra -Wpedantic -g3 -O0 -fPIC \
+	        -DISZ_MAX_SURFACES_PER_CLIENT=$(ISZ_MAX_SURFACES_PER_CLIENT) \
+	        -DISZ_MAX_CLIENTS=$(ISZ_MAX_CLIENTS) \
+	        -DISZ_MAX_DMABUF_IMPORTS_TOTAL=$(ISZ_MAX_DMABUF_IMPORTS_TOTAL) \
+	        -DISZ_THREAD_POOL_SIZE=$(ISZ_THREAD_POOL_SIZE) \
+	        -DISZ_MAX_EVENTS_PER_CLIENT=$(ISZ_MAX_EVENTS_PER_CLIENT) \
+	        -DENABLE_HDR=$(ENABLE_HDR) \
+	        -DENABLE_VRR=$(ENABLE_VRR) \
+	        -DENABLE_THREAD_POOL=$(ENABLE_THREAD_POOL) \
+	        -DENABLE_HEADLESS=$(ENABLE_HEADLESS) \
+	        -DISHIZUE_ENABLE_TEST_HOOKS \
+	        -Iinclude $$(pkg-config --cflags libdrm libinput libseat xkbcommon 2>/dev/null) \
+	        -c "$$f" -o "$$obj" || exit 1; \
+	done
+	$(CC) $$(find $(TEST_BUILD_DIR) -name '*.o') -o $(TEST_BUILD_DIR)/$(LIB_NAME) \
+	    -shared -Wl,--version-script=libishizue.map \
+	    -Wl,-soname,$(LIB_SONAME) \
+	    $$(pkg-config --libs libdrm libinput libseat xkbcommon 2>/dev/null)
+	ln -sf $(LIB_NAME) $(TEST_BUILD_DIR)/$(LIB_SONAME)
+	ln -sf $(LIB_SONAME) $(TEST_BUILD_DIR)/$(LIB_LINK)
+	@$(MAKE) -C tests \
+	    CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -g3 -O0 -I../include -I../src/input -DISHIZUE_ENABLE_TEST_HOOKS" \
+	    LDFLAGS="-L../$(TEST_BUILD_DIR) -Wl,-rpath,$$(pwd)/$(TEST_BUILD_DIR) -lishizue" \
+	    run
+	@rm -rf $(TEST_BUILD_DIR)
 
 install: all
 	install -Dm755 $(LIB_NAME) $(DESTDIR)$(LIBDIR)/$(LIB_NAME)
