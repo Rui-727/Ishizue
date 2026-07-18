@@ -294,6 +294,57 @@ enum isz_event_type {
     ISZ_EVENT_CLIPBOARD_REQUEST    = 19,
 };
 
+/* Event accessors - §5, §9. Allow reading isz_event fields without
+ * including internal headers. All return by value; pointers returned
+ * are valid only for the duration of the listener callback. */
+
+/* Common to all events. */
+enum isz_event_type isz_event_get_type(const isz_event *ev) ISZ_API;
+uint64_t isz_event_get_timestamp_ns(const isz_event *ev) ISZ_API; /* CLOCK_MONOTONIC_RAW */
+
+/* ISZ_EVENT_INPUT_POINTER_MOTION */
+int isz_event_get_pointer_motion(const isz_event *ev,
+                                  double *dx_out, double *dy_out,
+                                  double *abs_x_out, double *abs_y_out) ISZ_API;
+/* Returns 0 on success, ISZ_ERR_INVALID_ARG if ev is the wrong type. */
+
+/* ISZ_EVENT_INPUT_POINTER_BUTTON */
+int isz_event_get_pointer_button(const isz_event *ev,
+                                  uint32_t *button_out,
+                                  bool *press_out) ISZ_API;
+
+/* ISZ_EVENT_INPUT_POINTER_AXIS */
+int isz_event_get_pointer_axis(const isz_event *ev,
+                                double *dx_out, double *dy_out,
+                                int *source_out) ISZ_API; /* 0=finger, 1=wheel, 2=continuous */
+
+/* ISZ_EVENT_INPUT_KEYBOARD_KEY */
+int isz_event_get_keyboard_key(const isz_event *ev,
+                                uint32_t *keycode_out,
+                                bool *press_out) ISZ_API;
+
+/* ISZ_EVENT_INPUT_KEYBOARD_MODIFIERS */
+int isz_event_get_keyboard_modifiers(const isz_event *ev,
+                                      uint32_t *mods_depressed_out,
+                                      uint32_t *mods_latched_out,
+                                      uint32_t *mods_locked_out,
+                                      uint32_t *group_out) ISZ_API;
+
+/* ISZ_EVENT_INPUT_TOUCH_DOWN / MOTION / UP */
+int isz_event_get_touch(const isz_event *ev,
+                         int32_t *touch_id_out,
+                         double *x_out, double *y_out) ISZ_API;
+
+/* ISZ_EVENT_INPUT_KEYBOARD_FOCUS_CHANGED */
+isz_surface *isz_event_get_keyboard_focus(const isz_event *ev) ISZ_API;
+
+/* ISZ_EVENT_OUTPUT_ADD / REMOVE / CLIENT_CONNECT / CLIENT_DISCONNECT */
+isz_output *isz_event_get_output(const isz_event *ev) ISZ_API;
+const char *isz_event_get_client_binary_path(const isz_event *ev) ISZ_API; /* NULL-terminated, valid for the callback duration */
+
+/* ISZ_EVENT_CLIPBOARD_REQUEST */
+const char *isz_event_get_clipboard_mime_type(const isz_event *ev) ISZ_API;
+
 typedef void (*isz_event_listener_fn)(void *userdata, const isz_event *ev);
 
 int isz_add_listener(isz_server *srv, enum isz_event_type type,

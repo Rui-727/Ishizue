@@ -651,12 +651,9 @@ not need to be thread-safe.
 `type` is one of the `ISZ_EVENT_*` constants (see isz.h for the full
 list). `userdata` is opaque to the library.
 
-The `isz_event` struct is opaque in the public header. The internal
-layout (defined in `src/input/isz_seat_internal.h`) is a tagged union
-with `type` and `time_ns` (CLOCK_MONOTONIC_RAW) headers. Public
-accessors are not yet exposed; until they land, listeners include the
-internal header to read fields. A future minor version will add
-`isz_event_get_*` accessors so callers stay off internal headers.
+The `isz_event` struct is opaque in the public header. Listeners read
+fields through the `isz_event_get_*` accessors below; do not include
+internal headers from listener code.
 
 Return: `ISZ_OK`, `ISZ_ERR_INVALID_ARG`, or `ISZ_ERR_NO_MEMORY`.
 
@@ -672,6 +669,113 @@ fine. Newly-added listeners do not fire for the event currently being
 dispatched.
 
 Return: `ISZ_OK` or `ISZ_ERR_INVALID_ARG`.
+
+## Event accessors (SPEC §5, §9)
+
+`isz_event` is opaque; these are the only public way to read its
+fields. Call them from inside a listener callback. The event pointer
+is borrowed for the duration of the callback; do not retain it. All
+accessors are read-only and safe to call from the listener callback
+on the main dispatch thread.
+
+Each accessor validates `ev != NULL` and that `ev->type` matches the
+event the accessor is for. On mismatch, integer-returning accessors
+return `ISZ_ERR_INVALID_ARG`; pointer-returning accessors return
+`NULL`. Out-pointers may be passed as `NULL` to skip a field the
+caller does not care about.
+
+### `enum isz_event_type isz_event_get_type(const isz_event *ev)`
+
+Returns `ev->type`. Returns 0 on `NULL ev`. Common to every event;
+use this to dispatch inside a listener registered for more than one
+type (rare - most callers register one listener per type).
+
+### `uint64_t isz_event_get_timestamp_ns(const isz_event *ev)`
+
+Returns the `CLOCK_MONOTONIC_RAW` timestamp in nanoseconds. Returns 0
+on `NULL ev`. Common to every event.
+
+### `int isz_event_get_pointer_motion(const isz_event *ev, double *dx_out, double *dy_out, double *abs_x_out, double *abs_y_out)`
+
+Reads `ISZ_EVENT_INPUT_POINTER_MOTION`. `dx_out`/`dy_out` are relative
+motion (widened from the internal `int32_t` to `double` for caller
+convenience). `abs_x_out`/`abs_y_out` are the absolute position when
+the source supplied one; both are 0 when the event carries no
+absolute position. The accessor does not surface the internal
+`has_abs` flag - callers compare against the previous tracked
+position if they need to detect that case.
+
+Return: `ISZ_OK` or `ISZ_ERR_INVALID_ARG` (NULL `ev` or wrong type).
+
+### `int isz_event_get_pointer_button(const isz_event *ev, uint32_t *button_out, bool *press_out)`
+
+Reads `ISZ_EVENT_INPUT_POINTER_BUTTON`. `button_out` is the Linux
+input button code. `press_out` is true on press, false on release.
+
+Return: `ISZ_OK` or `ISZ_ERR_INVALID_ARG`.
+
+### `int isz_event_get_pointer_axis(const isz_event *ev, double *dx_out, double *dy_out, int *source_out)`
+
+Reads `ISZ_EVENT_INPUT_POINTER_AXIS`. `dx_out`/`dy_out` are scroll
+deltas. `source_out` is `0` (finger), `1` (wheel), or `2`
+(continuous). The numbering is fixed by the public contract and does
+not match the internal `enum isz_axis_source` ordering.
+
+Return: `ISZ_OK` or `ISZ_ERR_INVALID_ARG`.
+
+### `int isz_event_get_keyboard_key(const isz_event *ev, uint32_t *keycode_out, bool *press_out)`
+
+Reads `ISZ_EVENT_INPUT_KEYBOARD_KEY`. `keycode_out` is the Linux
+evdev keycode. `press_out` is true on press, false on release.
+
+Return: `ISZ_OK` or `ISZ_ERR_INVALID_ARG`.
+
+### `int isz_event_get_keyboard_modifiers(const isz_event *ev, uint32_t *mods_depressed_out, uint32_t *mods_latched_out, uint32_t *mods_locked_out, uint32_t *group_out)`
+
+Reads `ISZ_EVENT_INPUT_KEYBOARD_MODIFIERS`. The four fields are the
+xkbcommon modifier masks and the active layout group. The library
+fires this event whenever the XKB state changes.
+
+Return: `ISZ_OK` or `ISZ_ERR_INVALID_ARG`.
+
+### `int isz_event_get_touch(const isz_event *ev, int32_t *touch_id_out, double *x_out, double *y_out)`
+
+Reads `ISZ_EVENT_INPUT_TOUCH_DOWN`, `TOUCH_MOTION`, and `TOUCH_UP`.
+`touch_id_out` is the touch slot. `x_out`/`y_out` are the absolute
+position; for `TOUCH_UP` they mirror the last `TOUCH_MOTION` for the
+same slot. `ISZ_EVENT_INPUT_TOUCH_FRAME` carries no payload - do not
+call this accessor for it (it returns `ISZ_ERR_INVALID_ARG`).
+
+Return: `ISZ_OK` or `ISZ_ERR_INVALID_ARG`.
+
+### `isz_surface *isz_event_get_keyboard_focus(const isz_event *ev)`
+
+Reads `ISZ_EVENT_INPUT_KEYBOARD_FOCUS_CHANGED`. Returns the newly
+focused surface, or `NULL` when focus was cleared. The pointer is
+borrowed for the duration of the callback.
+
+### `isz_output *isz_event_get_output(const isz_event *ev)`
+
+For `ISZ_EVENT_OUTPUT_ADD` / `OUTPUT_REMOVE`. Returns the output the
+event is about, or `NULL` when the event payload is not wired (the
+current emit sites zero the union). Callers should fall back to
+`isz_output_list` to enumerate outputs after receiving these events;
+the accessor is forward-compatible with a later wave that populates
+the payload.
+
+### `const char *isz_event_get_client_binary_path(const isz_event *ev)`
+
+For `ISZ_EVENT_CLIENT_CONNECT` / `CLIENT_DISCONNECT`. Returns the
+peer binary path as a NUL-terminated string, valid for the duration
+of the callback, or `NULL` when the payload is not wired. Forward-
+compatible with a later wave that populates the path at emit.
+
+### `const char *isz_event_get_clipboard_mime_type(const isz_event *ev)`
+
+For `ISZ_EVENT_CLIPBOARD_REQUEST`. Returns the requested MIME type as
+a NUL-terminated string, valid for the duration of the callback, or
+`NULL` when no clipboard request is in flight. The clipboard request
+path is not yet wired in this build.
 
 ## Screen capture (SPEC §6.11, §7.11)
 

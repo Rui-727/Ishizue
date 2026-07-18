@@ -29,25 +29,13 @@
  * hook is synchronous, so the test never calls isz_dispatch and never
  * sleeps on a timer or real input.
  *
- * API gap: isz_event is opaque in the public header and has no field
- * accessors. To read ev->type and ev->u.keyboard_key, this test
- * includes the internal input header (src/input/isz_seat_internal.h)
- * where struct isz_event is defined. A future minor version should
- * grow public accessors (isz_event_get_type,
- * isz_event_get_keyboard_keycode, isz_event_get_keyboard_pressed, ...)
- * so tests and Architects stay off internal headers. */
+ * Event fields are read through the public isz_event_get_* accessors
+ * (W5-C), so this test no longer includes src/input/isz_seat_internal.h.
+ * The struct isz_event stays opaque in the public header. */
 
 #define _POSIX_C_SOURCE 200809L
 
 #include <ishizue/isz.h>
-
-/* Pulls in the concrete struct isz_event layout. The header only
- * declares internal functions (isz_log_internal, isz_server_emit_event,
- * ...) which this test never calls, so there are no link-time
- * dependencies on hidden symbols. ISHIZUE_HAVE_LIBINPUT / _XKBCOMMON /
- * _LIBSEAT are not defined for this build, so the corresponding system
- * headers are not pulled in. */
-#include "isz_seat_internal.h"
 
 #include <linux/input-event-codes.h>
 
@@ -83,17 +71,22 @@ struct output_state {
 static void on_key(void *ud, const isz_event *ev)
 {
     struct key_state *s = ud;
-    if (ev->type != ISZ_EVENT_INPUT_KEYBOARD_KEY)
+    uint32_t keycode = 0;
+    bool     pressed = false;
+
+    if (isz_event_get_type(ev) != ISZ_EVENT_INPUT_KEYBOARD_KEY)
+        return;
+    if (isz_event_get_keyboard_key(ev, &keycode, &pressed) != ISZ_OK)
         return;
     s->fired++;
-    s->keycode  = ev->u.keyboard_key.keycode;
-    s->pressed  = ev->u.keyboard_key.pressed;
+    s->keycode  = keycode;
+    s->pressed  = pressed;
 }
 
 static void on_output_add(void *ud, const isz_event *ev)
 {
     struct output_state *s = ud;
-    if (ev->type != ISZ_EVENT_OUTPUT_ADD)
+    if (isz_event_get_type(ev) != ISZ_EVENT_OUTPUT_ADD)
         return;
     s->fired++;
 }
