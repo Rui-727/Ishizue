@@ -1,0 +1,17 @@
+# Build artifacts
+*.o
+*.a
+libishizue.so
+libishizue.so.*
+/tests/run_tests
+/tests/*.test
+
+# Editor
+*.swp
+.*.swo
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

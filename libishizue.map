@@ -1,0 +1,6 @@
+LIBISHIZUE_MAP {
+    global:
+        isz_*;
+    local:
+        *;
+};
