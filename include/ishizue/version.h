@@ -12,4 +12,8 @@
      (ISHIZUE_VERSION_MINOR <<  8) | \
      (ISHIZUE_VERSION_PATCH))
 
+/* Runtime version query. Returns the ISHIZUE_VERSION_STRING constant.
+ * Visibility is set on the definition in src/util/isz_version.c. */
+const char *isz_version_string(void);
+
 #endif
