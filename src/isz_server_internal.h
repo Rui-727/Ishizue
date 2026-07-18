@@ -297,6 +297,13 @@ struct isz_server {
      * is available (e.g. headless backend commits without a client). */
     struct isz_buffer_cache buffer_cache;
 
+    /* W5-B: pending-release list (SPEC 7.5, 8). Buffers whose page-flip
+     * has fired but whose out_syncobj has not yet signalled. Drained by
+     * isz_buffer_poll_out_fences on each isz_dispatch iteration. Empty
+     * without ISHIZUE_HAVE_DRM (no syncobj is ever attached to a
+     * buffer, so the page-flip path releases buffers immediately). */
+    isz_list               pending_releases;
+
     /* PSI monitor (SPEC §8). */
     struct isz_psi_monitor  psi;
 
@@ -414,11 +421,23 @@ void isz_accept_connection(isz_server *srv) ISZ_INTERNAL;
 void isz_recv_client_messages(isz_server *srv, struct isz_client *c)
     ISZ_INTERNAL;
 
-/* Wave 3 stub: real per-message dispatch lands in a future wave. Logs
- * unknown messages at debug level. */
-void isz_handle_client_message(isz_server *srv, struct isz_conn *conn,
-                               uint32_t msg_id,
-                               const void *payload, size_t payload_len)
+/* Per-message dispatcher (isz_client_dispatch.c). Parses the payload,
+ * looks up the target object via isz_conn_lookup_object, calls the
+ * corresponding isz_* API on the connection's behalf, and queues the
+ * reply (or an ISZ_MSG_ERROR) on the connection's outbound queue.
+ *
+ * Per SPEC §6.12 fault tolerance: malformed payloads and bad object IDs
+ * log a warning + queue an error reply + continue. Only truly fatal
+ * violations (message before handshake_done) disconnect; the caller is
+ * responsible for closing the conn in that case (return value != 0).
+ *
+ * Returns ISZ_OK on tolerated errors / successful handling, or a
+ * negative ISZ_ERR_* if the dispatcher flagged this connection for
+ * disconnect (the caller marks the conn dead and runs §6.12 cleanup). */
+int isz_handle_client_message(isz_server *srv, struct isz_conn *conn,
+                              uint32_t msg_id,
+                              const uint8_t *payload, size_t payload_len,
+                              const int *fds, size_t n_fds)
     ISZ_INTERNAL;
 
 #endif /* ISZ_SERVER_INTERNAL_H */

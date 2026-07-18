@@ -14,6 +14,7 @@
 
 #include <ishizue/isz.h>
 
+#include "../util/isz_list.h"
 #include "../util/isz_compiler.h"
 
 /* A tracked buffer. Created by isz_buffer_import() (DMA-BUF) or
@@ -43,6 +44,30 @@ struct isz_buffer {
     void     *priv;
     size_t    priv_size;
     bool      is_shm;
+
+    /* W5-B explicit-sync state (SPEC 7.5). Both syncobj handles are
+     * server-side drm_syncobj handles created on the scanout GPU's
+     * drm_fd, valid only while ISHIZUE_HAVE_DRM is defined and the
+     * kernel advertises DRM_CAP_SYNCOBJ. They are 0 in every other
+     * configuration, including the headless test backend. */
+    uint32_t      in_syncobj;   /* render-GPU completion fence the
+                                 * display GPU waits on before scanout;
+                                 * 0 means "no explicit acquire fence" */
+    uint32_t      out_syncobj;  /* fence the library populates from the
+                                 * CRTC's OUT_FENCE_PTR after commit; the
+                                 * buffer is releasable to the client
+                                 * once it signals. 0 means implicit
+                                 * sync, release on page-flip event. */
+
+    /* Intrusive list node used by isz_buffer_on_page_flip /
+     * isz_buffer_poll_out_fences to track buffers whose out_syncobj
+     * has not signalled yet. Self-linked (not in any list) when the
+     * buffer is not pending release. */
+    isz_list_node release_node;
+
+    /* True once the buffer has been queued on the pending-release
+     * list so isz_buffer_unref can take it off before freeing. */
+    bool          release_pending;
 };
 
 /* Per-client import cache. SPEC §8: "the library caches recently-imported
@@ -107,5 +132,81 @@ int              isz_buffer_cache_insert(struct isz_buffer_cache *cache,
 void             isz_buffer_cache_evict(struct isz_buffer_cache *cache,
                                         int fd) ISZ_INTERNAL;
 void             isz_buffer_cache_destroy(struct isz_buffer_cache *cache) ISZ_INTERNAL;
+
+/* ------------------------------------------------------------------ */
+/* W5-B: explicit-sync entry points (SPEC 7.5)                        */
+/* ------------------------------------------------------------------ */
+/* The functions below are the buffer-layer surface the DRM atomic
+ * commit and page-flip paths call into. Declared unconditionally so
+ * the no-libdrm build still sees the symbols; the implementations
+ * are no-ops or feature-unavail returns without ISHIZUE_HAVE_DRM. */
+
+struct isz_server;
+
+/* DRM backend registers its fd at init so the buffer layer can reach
+ * it for drmSyncobj* calls without threading it through every call
+ * site. No-op without ISHIZUE_HAVE_DRM. */
+void isz_buffer_set_drm_fd(int drm_fd) ISZ_INTERNAL;
+
+/* Import a client-supplied sync_file fd as the buffer's acquire fence.
+ * The server creates a fresh drm_syncobj, attaches the fence to it
+ * via drmSyncobjImportSyncFile, and stores the handle on
+ * buf->in_syncobj. The atomic commit later exports a sync_file from
+ * this syncobj and sets it on the plane's IN_FENCE_FD property.
+ *
+ * Choice of convention: SPEC §8 doesn't fully specify the wire shape
+ * for in-fences. We use the linux-drm-syncobj-v1 model: the client
+ * passes a sync_file fd alongside the dmabuf (via SCM_RIGHTS, the
+ * same cmsg channel as the dmabuf itself), the server imports it
+ * into a server-side syncobj rather than juggling raw fds across
+ * commits. This matches what wlroots / Mutter do today, keeps the
+ * syncobj alive across multiple commits of the same buffer, and
+ * lets the server close the client fd immediately.
+ *
+ * drm_fd < 0 (no DRM backend) returns ISZ_ERR_FEATURE_UNAVAIL: the
+ * buffer carries no explicit in-fence and the atomic commit falls
+ * back to implicit sync. */
+int isz_buffer_set_in_fence_fd(struct isz_buffer *buf, int drm_fd,
+                               int sync_file_fd) ISZ_INTERNAL;
+
+/* Hook called by the DRM backend's page-flip event handler when a
+ * commit's flip completes. For each buffer the just-completed commit
+ * was scanning out, the backend adds the buffer to the server's
+ * pending-release list with a ref, then calls this entry point.
+ *
+ * If buf->out_syncobj == 0 (implicit sync), the buffer is sent to
+ * the owning client as ISZ_MSG_RELEASE immediately. If out_syncobj
+ * != 0 (explicit sync), the buffer stays on the pending-release
+ * list until isz_buffer_poll_out_fences observes the syncobj
+ * signalled.
+ *
+ * srv may be NULL in the headless build; in that case the function
+ * is a no-op (no wire to send on, no syncobj to wait for). */
+void isz_buffer_on_page_flip(struct isz_server *srv,
+                             struct isz_buffer *buf) ISZ_INTERNAL;
+
+/* Walk the server's pending-release list once. For each buffer whose
+ * out_syncobj has signalled, send ISZ_MSG_RELEASE and drop the buffer
+ * from the list. Called from isz_dispatch every iteration so
+ * explicit-sync releases make progress even without further
+ * page-flip events.
+ *
+ * Without ISHIZUE_HAVE_DRM this is a no-op: no syncobj is ever set
+ * on a buffer, so the pending-release list is always empty. */
+void isz_buffer_poll_out_fences(struct isz_server *srv) ISZ_INTERNAL;
+
+/* Drop any pending-release entries the server still holds. Called
+ * from isz_destroy so a teardown mid-flip doesn't leak buffer refs. */
+void isz_buffer_release_destroy(struct isz_server *srv) ISZ_INTERNAL;
+
+/* Wire send for ISZ_MSG_RELEASE (SPEC §8). Looks up the buffer's
+ * owning client and queues the message on its outbound connection.
+ * Returns ISZ_OK on success or a tolerant failure (client gone,
+ * buffer already destroyed); the caller always removes the buffer
+ * from the pending-release list regardless. The real wire encoding
+ * lands with the client dispatch wave; until then this is a
+ * debug-log stub so the link stays clean. */
+int isz_buffer_send_release(struct isz_server *srv,
+                            struct isz_buffer *buf) ISZ_INTERNAL;
 
 #endif /* ISZ_BUFFER_H */

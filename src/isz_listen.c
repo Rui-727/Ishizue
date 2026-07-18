@@ -25,8 +25,8 @@
  *
  * Wires the Architect-supplied listen fd into the server's epoll set and
  * owns accept + handshake + allowlist + the per-client recv path. Real
- * per-message dispatch lands in a later wave; this file routes every
- * framed message to isz_handle_client_message (a debug-log stub for now).
+ * per-message dispatch lives in isz_client_dispatch.c; this file routes
+ * every framed message there.
  *
  * Lifecycle:
  *
@@ -50,20 +50,7 @@
  *     cleanup: epoll_ctl DEL, isz_conn_close, unlink from the client
  *     list, emit CLIENT_DISCONNECT, free the client.
  *
- *   isz_handle_client_message(srv, conn, msg_id, payload, len)
- *     Wave 3 stub. Real per-message handlers come with the protocol
- *     dispatch wave; for now we log unknown message ids at debug so a
- *     developer running the library under ISZ_LOG_LEVEL=debug can see
- *     what clients are sending.
- *
- * Cross-wave externs resolved here:
- *
- *   isz_render_send_presented / isz_render_send_capture_done
- *     Wave 2-B's commit and capture paths call these to deliver
- *     ISZ_MSG_PRESENTED / ISZ_MSG_CAPTURE_DONE to clients. The real
- *     wire send comes with the per-message dispatch wave; this file
- *     stubs them so the .so links cleanly with zero undefined isz_*
- *     symbols.
+ * Cross-wave extern resolved here:
  *
  *   isz_backend_blank_all_crtcs
  *     Wave 2-D's crash handler calls this from signal context to black
@@ -329,60 +316,27 @@ void isz_recv_client_messages(isz_server *srv, struct isz_client *c)
             return;
         }
 
-        /* Close any fds we received; the per-message dispatch wave will
-         * route them to the right handler. For Wave 3 we just log and
-         * drop, so an early client doesn't leak fds. */
+        const uint8_t *payload = (const uint8_t *)buf + ISZ_MSG_HEADER_SIZE;
+        int rc = isz_handle_client_message(srv, c->conn, msg_id,
+                                           payload, payload_len,
+                                           fds, n_fds);
+        /* isz_handle_client_message consumed any fds it needed; any
+         * leftovers are closed here so we never leak. */
         for (size_t i = 0; i < n_fds; i++) {
-            close(fds[i]);
+            if (fds[i] >= 0)
+                close(fds[i]);
         }
 
-        const void *payload = (const uint8_t *)buf + ISZ_MSG_HEADER_SIZE;
-        isz_handle_client_message(srv, c->conn, msg_id,
-                                  payload, payload_len);
+        if (rc != ISZ_OK && c->conn != NULL) {
+            /* Fatal protocol violation; tear down the connection. */
+            isz_log_internal(ISZ_LOG_INFO,
+                             "client pid=%d fatal protocol violation, "
+                             "disconnecting (rc=%d)",
+                             (int)c->peer_pid, rc);
+            isz_client_cleanup(srv, c);
+            return;
+        }
     }
-}
-
-/* ------------------------------------------------------------------ */
-/* Wave 3 stub: per-message dispatch                                  */
-/* ------------------------------------------------------------------ */
-void isz_handle_client_message(isz_server *srv, struct isz_conn *conn,
-                               uint32_t msg_id,
-                               const void *payload, size_t payload_len)
-{
-    (void)srv;
-    (void)conn;
-    (void)payload;
-    isz_log_internal(ISZ_LOG_DEBUG,
-                     "client msg: id=%u payload_len=%zu (dispatch stub)",
-                     (unsigned)msg_id, payload_len);
-}
-
-/* ------------------------------------------------------------------ */
-/* Cross-wave externs: render send stubs (§6.5 presented, §7.11 done) */
-/* ------------------------------------------------------------------ */
-/* Real wire sends land with the per-message dispatch wave. For Wave 3
- * these stubs keep the link clean (zero undefined isz_* symbols) and
- * log at debug so an Architect can see when a commit/capture fires. */
-int isz_render_send_presented(isz_server *srv, isz_surface *surf,
-                              uint64_t vblank_ns)
-{
-    (void)srv;
-    (void)surf;
-    isz_log_internal(ISZ_LOG_DEBUG,
-                     "render: presented vblank_ns=%llu (send stub)",
-                     (unsigned long long)vblank_ns);
-    return ISZ_OK;
-}
-
-int isz_render_send_capture_done(isz_server *srv, isz_output *out,
-                                 int dmabuf_fd, isz_buffer_desc *desc)
-{
-    (void)srv;
-    (void)out;
-    (void)desc;
-    isz_log_internal(ISZ_LOG_DEBUG,
-                     "render: capture_done fd=%d (send stub)", dmabuf_fd);
-    return ISZ_OK;
 }
 
 /* ------------------------------------------------------------------ */

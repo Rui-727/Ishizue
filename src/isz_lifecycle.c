@@ -145,6 +145,7 @@ ISZ_API isz_server *isz_init(enum isz_backend_type backend, void *backend_config
         isz_list_init(&srv->listeners[i]);
 
     isz_buffer_cache_init(&srv->buffer_cache);
+    isz_list_init(&srv->pending_releases);
     isz_psi_init(&srv->psi);
 
     srv->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -318,6 +319,11 @@ ISZ_API void isz_dispatch(isz_server *srv)
      * input devices. */
     isz_session_dispatch(srv);
     isz_input_dispatch(srv);
+
+    /* W5-B: drain any pending explicit-sync buffer releases. No-op
+     * without ISHIZUE_HAVE_DRM (no syncobj is ever attached to a
+     * buffer, so the pending list stays empty). */
+    isz_buffer_poll_out_fences(srv);
 }
 
 /* ------------------------------------------------------------------ */
@@ -480,6 +486,7 @@ ISZ_API void isz_destroy(isz_server *srv)
 
     isz_psi_destroy(&srv->psi);
     isz_buffer_cache_destroy(&srv->buffer_cache);
+    isz_buffer_release_destroy(srv);
 
     if (srv->epoll_fd >= 0) {
         close(srv->epoll_fd);

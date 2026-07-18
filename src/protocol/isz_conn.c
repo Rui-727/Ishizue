@@ -70,6 +70,10 @@ struct isz_conn *isz_conn_create(int fd) {
     conn->send_head     = NULL;
     conn->send_tail     = NULL;
     conn->queued_events = 0;
+    conn->objects       = NULL;
+    conn->objects_count = 0;
+    conn->objects_cap   = 0;
+    conn->next_object_id = 1;  /* 0 is the sentinel */
 
     isz_proto_recv_state_init(&conn->recv_state);
 
@@ -107,6 +111,7 @@ void isz_conn_close(struct isz_conn *conn) {
     conn->queued_events = 0;
 
     isz_proto_recv_state_discard(&conn->recv_state);
+    free(conn->objects);
     free(conn);
 }
 
@@ -209,4 +214,61 @@ int isz_conn_drain(struct isz_conn *conn) {
         isz_msg_node_free(node);
     }
     return ISZ_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-connection object ID table (SPEC §6.4)                          */
+/* ------------------------------------------------------------------ */
+uint32_t isz_conn_register_object(struct isz_conn *conn, void *handle,
+                                  int kind) {
+    if (conn == NULL)
+        return 0;
+
+    if (conn->objects_count == conn->objects_cap) {
+        size_t ncap = conn->objects_cap ? conn->objects_cap * 2 : 8;
+        struct isz_conn_object_entry *ne =
+            realloc(conn->objects, ncap * sizeof(*ne));
+        if (ne == NULL)
+            return 0;
+        conn->objects = ne;
+        conn->objects_cap = ncap;
+    }
+
+    uint32_t id = conn->next_object_id++;
+    /* Wrap at 32 bits, skipping the 0 sentinel. */
+    if (conn->next_object_id == 0)
+        conn->next_object_id = 1;
+
+    conn->objects[conn->objects_count].id     = id;
+    conn->objects[conn->objects_count].handle = handle;
+    conn->objects[conn->objects_count].kind   = kind;
+    conn->objects_count++;
+    return id;
+}
+
+void *isz_conn_lookup_object(struct isz_conn *conn, uint32_t id, int kind) {
+    if (conn == NULL || id == 0)
+        return NULL;
+    for (size_t i = 0; i < conn->objects_count; i++) {
+        if (conn->objects[i].id == id) {
+            if (conn->objects[i].kind != kind)
+                return NULL;
+            return conn->objects[i].handle;
+        }
+    }
+    return NULL;
+}
+
+void isz_conn_unregister_object(struct isz_conn *conn, uint32_t id) {
+    if (conn == NULL || id == 0)
+        return;
+    for (size_t i = 0; i < conn->objects_count; i++) {
+        if (conn->objects[i].id == id) {
+            /* Compact by moving the tail entry down. */
+            conn->objects_count--;
+            if (i != conn->objects_count)
+                conn->objects[i] = conn->objects[conn->objects_count];
+            return;
+        }
+    }
 }

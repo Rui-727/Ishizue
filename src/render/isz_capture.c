@@ -43,6 +43,7 @@ static struct {
     int              dmabuf_fd;
     isz_buffer_desc  desc;
     bool             active;
+    struct isz_conn *owning_conn;   /* set by CAPTURE_START; cleared on stop */
 } s_capture[ISZ_CAPTURE_MAX];
 static size_t s_capture_count;
 
@@ -52,6 +53,29 @@ static size_t capture_find(isz_output *out)
         if (s_capture[i].out == out && s_capture[i].active)
             return i;
     return (size_t)-1;
+}
+
+/* The dispatcher (isz_client_dispatch.c) tags an active capture with
+ * the connection that started it, so isz_render_send_capture_done
+ * knows which client to ship the buffer back to. NULL-tolerant. */
+void isz_capture_set_owning_conn(isz_output *out, struct isz_conn *conn)
+{
+    if (!out)
+        return;
+    size_t idx = capture_find(out);
+    if (idx == (size_t)-1)
+        return;
+    s_capture[idx].owning_conn = conn;
+}
+
+struct isz_conn *isz_capture_get_owning_conn(isz_output *out)
+{
+    if (!out)
+        return NULL;
+    size_t idx = capture_find(out);
+    if (idx == (size_t)-1)
+        return NULL;
+    return s_capture[idx].owning_conn;
 }
 
 /* ------------------------------------------------------------------ */
@@ -102,6 +126,7 @@ ISZ_API int isz_output_capture_start(isz_output *out, int dmabuf_fd,
     s_capture[s_capture_count].dmabuf_fd = dmabuf_fd;
     s_capture[s_capture_count].desc = *desc;
     s_capture[s_capture_count].active = true;
+    s_capture[s_capture_count].owning_conn = NULL;  /* dispatcher sets it */
     s_capture_count++;
     return ISZ_OK;
 }

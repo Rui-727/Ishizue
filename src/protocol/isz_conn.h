@@ -35,6 +35,24 @@
 # define ISZ_MAX_EVENTS_PER_CLIENT 1024
 #endif
 
+/* SPEC §6.4 object model: object IDs are per-connection, server-assigned,
+ * 32-bit. ID 0 is reserved for "no object" (sentinel for failed lookups
+ * and unset registrations). The first registered object gets id 1 and
+ * IDs increase monotonically for the lifetime of the connection. */
+enum isz_conn_object_kind {
+    ISZ_OBJECT_NONE    = 0,
+    ISZ_OBJECT_SURFACE = 1,
+    ISZ_OBJECT_BUFFER  = 2,
+    ISZ_OBJECT_OUTPUT  = 3,
+    ISZ_OBJECT_SEAT    = 4,
+};
+
+struct isz_conn_object_entry {
+    uint32_t id;
+    void    *handle;
+    int      kind;
+};
+
 struct isz_msg_node {
     struct isz_msg_node *next;
     size_t               total;     /* bytes in buf (header + payload) */
@@ -59,6 +77,15 @@ struct isz_conn {
     struct isz_msg_node             *send_head;
     struct isz_msg_node             *send_tail;
     size_t                           queued_events;
+
+    /* Per-connection object ID table (SPEC §6.4). Grows geometrically.
+     * The dispatcher's register/lookup helpers walk this list linearly;
+     * v1 client object counts are small enough that a hash table is not
+     * worth the complexity. */
+    struct isz_conn_object_entry    *objects;
+    size_t                           objects_count;
+    size_t                           objects_cap;
+    uint32_t                         next_object_id;
 };
 
 /* Take ownership of fd. Sets SO_SNDBUF to ISZ_DEFAULT_SNDBUF. Returns
@@ -113,5 +140,29 @@ int isz_conn_drain(struct isz_conn *conn)
 int isz_handshake_server_side(struct isz_conn *conn)
     ISZ_INTERNAL
     __attribute__((nonnull(1)));
+
+/* ------------------------------------------------------------------ */
+/* Per-connection object ID table (SPEC §6.4)                          */
+/* ------------------------------------------------------------------ */
+/* Register a server-side object (surface, buffer, output, seat proxy)
+ * on the connection and return its freshly-allocated 32-bit id. The id
+ * is per-connection: the same server-side object may carry different
+ * ids on different conns. Returns 0 on allocation failure (callers
+ * treat 0 as "no id" since 0 is the sentinel). */
+uint32_t isz_conn_register_object(struct isz_conn *conn, void *handle,
+                                  int kind)
+    ISZ_INTERNAL
+    __attribute__((nonnull(1)));
+
+/* Look up an object by id. kind is the expected kind (ISZ_OBJECT_SURFACE,
+ * ...); a mismatch returns NULL, as does a missing id. NULL-tolerant
+ * on conn. */
+void *isz_conn_lookup_object(struct isz_conn *conn, uint32_t id, int kind)
+    ISZ_INTERNAL;
+
+/* Drop the registration for id (if present). The server-side object is
+ * not freed here; the caller owns its lifecycle. */
+void isz_conn_unregister_object(struct isz_conn *conn, uint32_t id)
+    ISZ_INTERNAL;
 
 #endif /* ISHIZUE_CONN_H */

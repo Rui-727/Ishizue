@@ -440,29 +440,6 @@ static void isz_handle_attach_buffer(struct isz_conn *conn,
     isz_reply_attach_buffer(conn, surface_id, buffer_id);
 }
 
-static void isz_handle_detach_buffer(struct isz_conn *conn,
-                                     const uint8_t *payload,
-                                     size_t payload_len)
-{
-    uint32_t surface_id = 0;
-    size_t off = 0;
-    if (!isz_proto_read_u32_checked(payload, &off, payload_len, &surface_id)) {
-        isz_reply_error(conn, ISZ_MSG_SURFACE_DETACH_BUFFER,
-                        ISZ_ERR_INVALID_ARG);
-        return;
-    }
-    isz_surface *surf =
-        isz_conn_lookup_object(conn, surface_id, ISZ_OBJECT_SURFACE);
-    if (!surf) {
-        isz_reply_error(conn, ISZ_MSG_SURFACE_DETACH_BUFFER,
-                        ISZ_ERR_INVALID_ARG);
-        return;
-    }
-    int rc = isz_surface_detach_buffer(surf);
-    if (rc != ISZ_OK)
-        isz_reply_error(conn, ISZ_MSG_SURFACE_DETACH_BUFFER, rc);
-}
-
 static void isz_handle_damage(struct isz_conn *conn,
                               const uint8_t *payload, size_t payload_len)
 {
@@ -1234,10 +1211,6 @@ int isz_handle_client_message(isz_server *srv, struct isz_conn *conn,
 
     case ISZ_MSG_SURFACE_ATTACH_BUFFER:
         isz_handle_attach_buffer(conn, payload, payload_len, fds, n_fds);
-        break;
-
-    case ISZ_MSG_SURFACE_DETACH_BUFFER:
-        isz_handle_detach_buffer(conn, payload, payload_len);
         break;
 
     case ISZ_MSG_SURFACE_DAMAGE:

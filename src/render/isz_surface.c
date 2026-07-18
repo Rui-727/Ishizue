@@ -70,6 +70,8 @@ ISZ_API isz_surface *isz_surface_create(isz_server *srv)
     s->kind = ISZ_SURFACE_NORMAL;
     s->plane_slot = -1;
     s->transform = ISZ_TRANSFORM_NORMAL;
+    s->owning_conn = NULL;
+    s->object_id = 0;
     surface_init_nodes(s);
 
     ensure_list_inited();

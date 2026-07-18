@@ -319,4 +319,47 @@ ssize_t isz_proto_recv_version_reply(int fd, uint32_t *version_out)
     ISZ_INTERNAL
     __attribute__((nonnull(2)));
 
+/* ------------------------------------------------------------------ */
+/* Payload read/write helpers (SPEC §6.1: little-endian on the wire)  */
+/* ------------------------------------------------------------------ */
+/* The dispatcher builds and parses message payloads with these. They
+ * take a payload buffer plus an offset and return the new offset, so
+ * callers can chain: off = isz_proto_write_u32(p, off, x); Reading past
+ * the end of payload_len is the caller's responsibility; these helpers
+ * do not bounds-check, they only do the byte-order conversion. */
+
+size_t isz_proto_write_u32(void *buf, size_t off, uint32_t v)
+    ISZ_INTERNAL;
+size_t isz_proto_write_i32(void *buf, size_t off, int32_t v)
+    ISZ_INTERNAL;
+size_t isz_proto_write_u64(void *buf, size_t off, uint64_t v)
+    ISZ_INTERNAL;
+size_t isz_proto_write_u8(void *buf, size_t off, uint8_t v)
+    ISZ_INTERNAL;
+
+uint32_t isz_proto_read_u32(const void *buf, size_t off)
+    ISZ_INTERNAL;
+int32_t  isz_proto_read_i32(const void *buf, size_t off)
+    ISZ_INTERNAL;
+uint64_t isz_proto_read_u64(const void *buf, size_t off)
+    ISZ_INTERNAL;
+uint8_t  isz_proto_read_u8(const void *buf, size_t off)
+    ISZ_INTERNAL;
+
+/* Bounds-checked helpers: if off + len would exceed payload_len, return
+ * false (parse failure). Otherwise read the value through *out and
+ * return the new offset in *off. */
+bool isz_proto_read_u32_checked(const void *buf, size_t *off,
+                                size_t payload_len, uint32_t *out)
+    ISZ_INTERNAL
+    __attribute__((nonnull(1, 2, 4)));
+bool isz_proto_read_i32_checked(const void *buf, size_t *off,
+                                size_t payload_len, int32_t *out)
+    ISZ_INTERNAL
+    __attribute__((nonnull(1, 2, 4)));
+bool isz_proto_read_u64_checked(const void *buf, size_t *off,
+                                size_t payload_len, uint64_t *out)
+    ISZ_INTERNAL
+    __attribute__((nonnull(1, 2, 4)));
+
 #endif /* ISHIZUE_PROTOCOL_H */

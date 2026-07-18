@@ -28,6 +28,12 @@
 #include "../util/isz_list.h"
 #include "../buffer/isz_buffer.h"
 
+/* Forward: surfaces point back at the owning connection (the dispatcher
+ * sets this when a client creates a surface). isz_conn.h is not included
+ * here to keep the include graph shallow; the concrete layout lives in
+ * src/protocol/isz_conn.h. */
+struct isz_conn;
+
 /* ------------------------------------------------------------------ */
 /* Surface kinds (6.6, 6.7).                                          */
 /* ------------------------------------------------------------------ */
@@ -47,6 +53,15 @@ enum isz_surface_kind {
 struct isz_surface {
     isz_server *srv;
     uint32_t    client_id;   /* 0 for Architect-created surfaces */
+
+    /* Connection ownership (SPEC §6.4). Set by the dispatcher when a
+     * client creates the surface; NULL for Architect-created surfaces
+     * (isz_surface_create called directly). object_id is the per-
+     * connection id assigned by isz_conn_register_object, or 0 if the
+     * surface is not registered on any connection. Used by the commit
+     * path to send presented events back to the owning client. */
+    struct isz_conn *owning_conn;
+    uint32_t         object_id;
 
     enum isz_surface_kind kind;
 

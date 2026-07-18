@@ -483,3 +483,75 @@ ssize_t isz_proto_recv_version_reply(int fd, uint32_t *version_out) {
     *version_out = isz_get_u32_le(buf);
     return (ssize_t)sizeof(buf);
 }
+
+/* ------------------------------------------------------------------ */
+/* Payload read/write helpers                                          */
+/* ------------------------------------------------------------------ */
+size_t isz_proto_write_u32(void *buf, size_t off, uint32_t v) {
+    isz_put_u32_le((uint8_t *)buf + off, v);
+    return off + 4u;
+}
+
+size_t isz_proto_write_i32(void *buf, size_t off, int32_t v) {
+    isz_put_u32_le((uint8_t *)buf + off, (uint32_t)v);
+    return off + 4u;
+}
+
+size_t isz_proto_write_u64(void *buf, size_t off, uint64_t v) {
+    uint8_t *p = (uint8_t *)buf + off;
+    for (int i = 0; i < 8; i++)
+        p[i] = (uint8_t)((v >> (8 * i)) & 0xffu);
+    return off + 8u;
+}
+
+size_t isz_proto_write_u8(void *buf, size_t off, uint8_t v) {
+    ((uint8_t *)buf)[off] = v;
+    return off + 1u;
+}
+
+uint32_t isz_proto_read_u32(const void *buf, size_t off) {
+    return isz_get_u32_le((const uint8_t *)buf + off);
+}
+
+int32_t isz_proto_read_i32(const void *buf, size_t off) {
+    return (int32_t)isz_get_u32_le((const uint8_t *)buf + off);
+}
+
+uint64_t isz_proto_read_u64(const void *buf, size_t off) {
+    const uint8_t *p = (const uint8_t *)buf + off;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++)
+        v |= ((uint64_t)p[i]) << (8 * i);
+    return v;
+}
+
+uint8_t isz_proto_read_u8(const void *buf, size_t off) {
+    return ((const uint8_t *)buf)[off];
+}
+
+bool isz_proto_read_u32_checked(const void *buf, size_t *off,
+                                size_t payload_len, uint32_t *out) {
+    if (*off > payload_len || payload_len - *off < 4u)
+        return false;
+    *out = isz_proto_read_u32(buf, *off);
+    *off += 4u;
+    return true;
+}
+
+bool isz_proto_read_i32_checked(const void *buf, size_t *off,
+                                size_t payload_len, int32_t *out) {
+    if (*off > payload_len || payload_len - *off < 4u)
+        return false;
+    *out = isz_proto_read_i32(buf, *off);
+    *off += 4u;
+    return true;
+}
+
+bool isz_proto_read_u64_checked(const void *buf, size_t *off,
+                                size_t payload_len, uint64_t *out) {
+    if (*off > payload_len || payload_len - *off < 8u)
+        return false;
+    *out = isz_proto_read_u64(buf, *off);
+    *off += 8u;
+    return true;
+}

@@ -5,12 +5,17 @@
 /* isz_buffer.c - DMA-BUF import, release tracking, per-client cache.
  * SPEC §8. Wave 1 scope: tracking and bookkeeping only; the actual
  * drmPrimeFDToHandle() call is made by the DRM backend wave, guarded
- * here by ISHIZUE_HAVE_DRM. */
+ * here by ISHIZUE_HAVE_DRM.
+ *
+ * W5-B adds the explicit-sync release path: buffers with a non-zero
+ * out_syncobj stay on the server's pending-release list after their
+ * page-flip fires, polled each dispatch until the syncobj signals. */
 
 /* Enable POSIX.1-2008 symbols under -std=c11 (close, munmap, mmap). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "isz_buffer.h"
+#include "isz_syncobj.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -18,13 +23,20 @@
 #include <unistd.h>
 
 #include <ishizue/isz.h>
+#include "../isz_server_internal.h"
+#include "../util/isz_log.h"
 
 /* When libdrm is available, the DRM backend wave will define
  * isz_buffer_drm_import() to call drmPrimeFDToHandle() and stash the
  * GEM handle on the buffer. Until then, import just records the fd. */
 #ifdef ISHIZUE_HAVE_DRM
-extern int isz_buffer_drm_import(struct isz_buffer *buf);
+extern int  isz_buffer_drm_import(struct isz_buffer *buf);
 extern void isz_buffer_drm_release(struct isz_buffer *buf);
+
+/* W5-B: g_drm_fd is set by the DRM backend's init via
+ * isz_buffer_set_drm_fd so the syncobj helpers can reach the fd
+ * without threading it through every call. -1 means no DRM backend. */
+static int g_drm_fd = -1;
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -73,6 +85,13 @@ int isz_buffer_import(uint32_t client_id, int dmabuf_fd,
     buf->priv       = NULL;
     buf->priv_size  = 0;
     buf->is_shm     = false;
+    buf->in_syncobj      = 0;
+    buf->out_syncobj     = 0;
+    buf->release_pending = false;
+    /* Self-linked = not in any list. isz_list_remove on these is a
+     * no-op, so unref is safe whether or not the buffer was queued. */
+    buf->release_node.prev = &buf->release_node;
+    buf->release_node.next = &buf->release_node;
 
 #ifdef ISHIZUE_HAVE_DRM
     int ret = isz_buffer_drm_import(buf);
@@ -114,6 +133,27 @@ void isz_buffer_unref(struct isz_buffer *buf)
 #ifdef ISHIZUE_HAVE_DRM
     isz_buffer_drm_release(buf);
 #endif
+
+    /* W5-B: destroy syncobjs the buffer may hold. The DRM backend's
+     * isz_buffer_drm_release handles the GEM handle; syncobj lifetime
+     * is owned here so the buffer layer stays the single owner. */
+#ifdef ISHIZUE_HAVE_DRM
+    if (buf->in_syncobj != 0) {
+        isz_syncobj_destroy(g_drm_fd, buf->in_syncobj);
+        buf->in_syncobj = 0;
+    }
+    if (buf->out_syncobj != 0) {
+        isz_syncobj_destroy(g_drm_fd, buf->out_syncobj);
+        buf->out_syncobj = 0;
+    }
+#endif
+
+    /* Pull the buffer off any pending-release list before freeing.
+     * The list head lives on the server; if the buffer was never
+     * queued, the node is self-linked and isz_list_remove is a
+     * no-op. */
+    isz_list_remove(&buf->release_node);
+    buf->release_pending = false;
 
     if (buf->is_shm && buf->priv != NULL) {
         /* SHM fallback: munmap the CPU mapping. SPEC §11. The SHM
@@ -275,4 +315,154 @@ void isz_buffer_cache_destroy(struct isz_buffer_cache *cache)
         e->buf = NULL;
     }
     cache->count = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* W5-B: explicit-sync entry points (SPEC 7.5, 8, 11)                 */
+/* ------------------------------------------------------------------ */
+
+#ifdef ISHIZUE_HAVE_DRM
+/* Set by the DRM backend at init so the buffer layer can reach the
+ * fd for drmSyncobj* calls without the caller having to pass it
+ * every time. Mirrors the W4-A g_drm_state singleton pattern. */
+void isz_buffer_set_drm_fd(int drm_fd)
+{
+    g_drm_fd = drm_fd;
+    if (drm_fd >= 0)
+        isz_log_internal(ISZ_LOG_DEBUG,
+                         "buffer: explicit-sync drm_fd=%d", drm_fd);
+}
+#else
+void isz_buffer_set_drm_fd(int drm_fd)
+{
+    (void)drm_fd;
+}
+#endif
+
+int isz_buffer_set_in_fence_fd(struct isz_buffer *buf, int drm_fd,
+                               int sync_file_fd)
+{
+    if (buf == NULL || sync_file_fd < 0)
+        return ISZ_ERR_INVALID_ARG;
+#ifdef ISHIZUE_HAVE_DRM
+    if (drm_fd < 0)
+        return ISZ_ERR_FEATURE_UNAVAIL;
+
+    /* If the buffer already had an in_syncobj (re-attach), reset it
+     * before importing a new fence so the old fence state doesn't
+     * leak into the new one. */
+    if (buf->in_syncobj == 0) {
+        buf->in_syncobj = isz_syncobj_create(drm_fd);
+        if (buf->in_syncobj == 0)
+            return ISZ_ERR_COMMIT_FAILED;
+    } else {
+        isz_syncobj_reset(drm_fd, buf->in_syncobj);
+    }
+    int rc = isz_syncobj_import_sync_file(drm_fd, buf->in_syncobj,
+                                          sync_file_fd);
+    if (rc != ISZ_OK) {
+        isz_syncobj_destroy(drm_fd, buf->in_syncobj);
+        buf->in_syncobj = 0;
+        return rc;
+    }
+    return ISZ_OK;
+#else
+    (void)drm_fd;
+    return ISZ_ERR_FEATURE_UNAVAIL;
+#endif
+}
+
+/* Called by the DRM backend's page-flip handler. Implicit-sync
+ * buffers (out_syncobj == 0) are released to the client immediately.
+ * Explicit-sync buffers stay on the pending list;
+ * isz_buffer_poll_out_fences drains them once the syncobj signals. */
+void isz_buffer_on_page_flip(struct isz_server *srv,
+                             struct isz_buffer *buf)
+{
+    if (buf == NULL)
+        return;
+#ifdef ISHIZUE_HAVE_DRM
+    if (buf->out_syncobj != 0) {
+        /* Defer: poll later. The buffer was already added to the
+         * pending-release list by the page-flip handler; nothing to
+         * do here but wait. */
+        isz_log_internal(ISZ_LOG_DEBUG,
+                         "buffer %p: deferring release on out_syncobj=%u",
+                         (void *)buf, (unsigned)buf->out_syncobj);
+        return;
+    }
+#else
+    (void)srv;
+#endif
+    /* Implicit sync (or no DRM): release straight away. */
+    isz_buffer_send_release(srv, buf);
+    isz_buffer_release(buf);
+}
+
+void isz_buffer_poll_out_fences(struct isz_server *srv)
+{
+    if (srv == NULL)
+        return;
+    /* Walk the pending list, releasing buffers whose out_syncobj has
+     * signalled. We can't use isz_list_for_each here because
+     * isz_buffer_send_release -> isz_buffer_unref may unlink the
+     * node mid-iteration. Pop-front is safe. */
+    isz_list_node *node;
+    while ((node = isz_list_pop_front(&srv->pending_releases)) != NULL) {
+        struct isz_buffer *buf =
+            container_of(node, struct isz_buffer, release_node);
+        buf->release_pending = false;
+#ifdef ISHIZUE_HAVE_DRM
+        if (buf->out_syncobj != 0 &&
+            !isz_syncobj_poll(g_drm_fd, buf->out_syncobj)) {
+            /* Not signalled yet; requeue and stop draining. The wait
+             * is non-blocking and we just popped this entry, so we
+             * re-add it to the tail for the next dispatch iteration.
+             * We then bail out so we don't busy-loop on the same
+             * unready buffer. */
+            isz_list_push_back(&srv->pending_releases,
+                               &buf->release_node);
+            buf->release_pending = true;
+            return;
+        }
+#endif
+        isz_buffer_send_release(srv, buf);
+        isz_buffer_release(buf);
+        /* isz_buffer_release only marks the buffer; the ref the
+         * pending list held is dropped here. */
+        isz_buffer_unref(buf);
+    }
+}
+
+void isz_buffer_release_destroy(struct isz_server *srv)
+{
+    if (srv == NULL)
+        return;
+    /* Drop the ref each pending entry holds. isz_buffer_unref also
+     * unlinks the node, but iterating via pop-front is clearer. */
+    isz_list_node *node;
+    while ((node = isz_list_pop_front(&srv->pending_releases)) != NULL) {
+        struct isz_buffer *buf =
+            container_of(node, struct isz_buffer, release_node);
+        buf->release_pending = false;
+        isz_buffer_release(buf);
+        isz_buffer_unref(buf);
+    }
+}
+
+/* Wire send for ISZ_MSG_RELEASE (SPEC §8). The real wire encoding
+ * (looking up the client by client_id, framing a 4-byte payload
+ * with the buffer_id, sendmsg) lands with the per-message dispatch
+ * wave. Until then this stub keeps the link clean and gives the
+ * dispatcher a single function to override later. */
+int isz_buffer_send_release(struct isz_server *srv,
+                            struct isz_buffer *buf)
+{
+    if (srv == NULL || buf == NULL)
+        return ISZ_ERR_INVALID_ARG;
+    isz_log_internal(ISZ_LOG_DEBUG,
+                     "buffer: release client_id=%u buffer_fd=%d "
+                     "(wire send stub)",
+                     (unsigned)buf->client_id, buf->dmabuf_fd);
+    return ISZ_OK;
 }
