@@ -175,7 +175,10 @@ Entries are evaluated at `isz_init()` and cached. On connect, the library checks
 ### 6.4 Object model
 
 - Object IDs: the server owns object ID allocation. When the library creates an object (surface, buffer, seat proxy), it generates a unique 32-bit ID and returns it to the client in the response message. Clients refer to existing objects by these IDs in subsequent requests. IDs are per-connection, not global across the server.
-- v1 object/feature set (full scope, not minimal): surface, buffer, output, seat (keyboard/pointer), popups/menus, drag-and-drop, clipboard, layer-shell equivalent (bars, panels, lock screens), screen capture, subsurfaces, cursor themes.
+- Surface serials: every surface creation also returns a serial, a 64-bit monotonic number unique per server lifetime, never reused after the surface is destroyed. Object IDs are per-connection; serials are global to the server. The serial is for cross-subsystem pairing. The X11 bridge (§13) can attach an X11 window XID to a surface via serial lookup rather than per-connection ID, and input events (§9) carry the serial of the surface they targeted so any subsystem can name a surface without holding the owning client's ID space.
+- v1 object/feature set (full scope, not minimal): surface, buffer, output, seat (keyboard/pointer), popups/menus, drag-and-drop, clipboard, layer-shell equivalent (bars, panels, lock screens), screen capture, subsurfaces, cursor themes, surface roles (§6.17).
+
+Rationale (surface serials, surface roles): research/wlroots-xwayland-patterns.md §5 (W6-C) documents the WL_SURFACE_ID race wlroots fixed via xwayland-shell-v1.set_serial; a native serial removes the need for that pairing dance. research/wlroots-xwayland-patterns.md §18 (W6-C, finding #2) recommends a native X11-surface role for direct XID pairing at surface creation.
 
 ### 6.5 Global objects (outputs and seat)
 
@@ -201,6 +204,12 @@ Clipboard data transfers as a DMA-BUF (images) or a `memfd` (text and other smal
 
 The library never parses, converts, or copies clipboard data; it only transfers the fd and MIME type atomically. Content filtering (allowing text but not images, for example) is Architect policy, implemented via a listener on `ISZ_EVENT_CLIPBOARD_REQUEST`.
 
+Two selection slots per seat: PRIMARY (set by mouse-select, pasted by middle-click) and CLIPBOARD (set by Ctrl+C, pasted by Ctrl+V), mirroring the X11 convention. Each slot has its own owner and MIME list and is independent of the other; both use the same fd-passing mechanism described above. Whether the two are kept in sync, mirrored on focus change, or kept entirely separate is Architect policy. The library exposes them as two distinct slots: `isz_seat_set_selection_owner(seat, ISZ_SELECTION_PRIMARY, ...)` and `isz_seat_set_selection_owner(seat, ISZ_SELECTION_CLIPBOARD, ...)`.
+
+Selection-ownership timestamps: every ownership change carries a `CLOCK_MONOTONIC_RAW` timestamp in nanoseconds. The library uses this to break ties when multiple clients claim ownership in quick succession: the latest timestamp wins; claims older than the current owner's timestamp are rejected. The timestamp is exposed to the Architect via `ISZ_EVENT_CLIPBOARD_REQUEST` so the Architect can reason about staleness. X11 selection timestamps are millisecond counters from an arbitrary epoch; the X11 bridge (§13) translates them to `CLOCK_MONOTONIC_RAW` on the way in.
+
+Rationale (PRIMARY, selection timestamp): research/xwayland-architecture.md §7 (W6-A) notes X11 has both PRIMARY and CLIPBOARD selections and the original §6.8 described only one clipboard channel. research/wlroots-xwayland-patterns.md §12 (W6-C) and §18 (W6-C, finding #5) note wlroots treats X11 timestamps and Wayland serials as opaque and unrelated; a first-class timestamp lets the bridge translate cleanly and lets the Architect reject stale claims.
+
 ### 6.9 Drag-and-drop
 
 A client starts a drag with `drag_start`, providing a source surface, an optional icon surface, and the MIME types on offer. The library tracks drag state and delivers `drag_motion` events to surfaces under the pointer. The surface under the pointer responds with `drag_accept` or `drag_reject`. On pointer release, the library sends `drag_drop` to the accepting target, followed by a data transfer using the same fd-passing mechanism as the clipboard (§6.8).
@@ -219,9 +228,18 @@ int isz_seat_set_cursor_visible(isz_seat *seat, bool visible);
 
 The library doesn't animate cursors or handle theme fallback; that's the Architect's job.
 
-### 6.11 Screen Capture Permission
+### 6.11 Portal consent
 
-Portal-style consent: an explicit per-request user grant, even though Ishizue itself does the prompting (no external portal daemon dependency implied). See §7.11 for the capture API and its interaction with consent.
+Portal-style consent: an explicit per-request user grant, with a timeout, even though Ishizue itself does the prompting (no external portal daemon dependency implied). The mechanism is the same per-request grant for every consent type; only the scope differs:
+
+- Screen capture (see §7.11 for the capture API and its interaction with consent).
+- File access, for sandboxed (flatpak-style) applications that need to read or write files outside their namespace.
+- Notification forwarding, for sandboxed applications that need to surface notifications through the Architect.
+- Any other portal-style consent the Architect chooses to route through this mechanism.
+
+For each request, the library emits a consent-request event; the Architect prompts the user and responds with grant or deny. The library does not decide what counts as a grantable request; that is Architect policy. A separate `ishizue-portal` process, allowlisted like the X11 bridge (§13), is the expected shape for full xdg-desktop-portal compatibility; Ishizue itself only owns the consent primitive.
+
+Rationale: research/client-stack-ecosystem.md §6 (W6-E) notes the original §6.11 covered screen capture only and that file access, notification forwarding, and other portal-style consent fit the same per-request user-grant mechanism.
 
 ### 6.12 Fault tolerance and disconnection
 
@@ -242,6 +260,67 @@ The library uses `SO_SNDBUF` (default 262144 bytes) for each client socket. If a
 ### 6.14 No separate scripting IPC
 
 Anything like i3-ipc/sway-ipc for status bars or scripts is the Architect's problem, not part of this library.
+
+### 6.15 Idle inhibit
+
+The library exposes a per-surface idle-inhibit flag:
+
+```c
+int isz_surface_set_idle_inhibit(isz_surface *surf, bool inhibit);
+```
+
+For each output, the library tracks whether any surface on that output has the flag set. When the count goes from zero to one, the library emits `ISZ_EVENT_IDLE_INHIBIT_ACTIVE` for that output; when it returns to zero, the library emits `ISZ_EVENT_IDLE_INHIBIT_INACTIVE`. The library itself does not touch any idle timer, screensaver, or DPMS state. What the Architect does on `ACTIVE` or `INACTIVE` (disable a screensaver timer, inhibit DPMS-off, ignore the event) is policy and stays with the Architect. The library makes no decision about whether to honor an inhibit request from an unfocused or offscreen surface; if the flag is set, the flag is set.
+
+Rationale: research/xwayland-architecture.md §12 (W6-A) notes the X11 `XScreenSaverSuspend` protocol does not work under rootless Xwayland and that Wayland's `zwp_idle_inhibit_manager_v1` is the equivalent; the original SPEC had no idle-inhibit mechanism.
+
+### 6.16 Text input and input methods
+
+Mobile on-screen keyboards, CJK input methods, and accessibility input methods need to exchange composition state with focused clients: preedit text (intermediate composition), commit text (final input), cursor position, and surrounding text retrieval. The library exposes a per-seat text-input object on the client side and a per-seat input-method object on the IME side.
+
+Client side:
+
+```c
+isz_text_input *isz_seat_create_text_input(isz_seat *seat);
+int isz_text_input_set_surrounding_text(isz_text_input *ti, const char *text,
+                                        uint32_t cursor, uint32_t anchor);
+int isz_text_input_set_content_type(isz_text_input *ti, enum isz_text_content_type hint);
+int isz_text_input_set_cursor_rectangle(isz_text_input *ti, int32_t x, int32_t y,
+                                        int32_t width, int32_t height);
+int isz_text_input_enable(isz_text_input *ti);
+int isz_text_input_disable(isz_text_input *ti);
+int isz_text_input_commit_string(isz_text_input *ti, const char *text);
+int isz_text_input_preedit_string(isz_text_input *ti, const char *text,
+                                  int32_t cursor_begin, int32_t cursor_end);
+```
+
+IME side:
+
+```c
+isz_input_method *isz_seat_create_input_method(isz_seat *seat);
+```
+
+The library routes preedit, commit, and cursor-rectangle state between the active input method and the focused text-input. When a text-input is enabled on the focused surface, the library emits `ISZ_EVENT_TEXT_INPUT_PREEDIT` (carrying preedit text and cursor range), `ISZ_EVENT_TEXT_INPUT_COMMIT` (carrying committed text), and `ISZ_EVENT_TEXT_INPUT_CURSOR_RECTANGLE_NEEDED` (when the IME asks for the cursor rectangle, the library forwards the focused surface's cursor rectangle back to the IME). The library does no text composition itself; composition is the IME's job. Routing policy (which IME gets the seat, when to enable vs. disable, what to do when no IME is connected) is the Architect's, mediated by the enable and disable calls.
+
+This is the Ishizue API shape, not a Wayland text-input-v3 or input-method-v2 binding. The two Wayland protocols are cross-referenced as design precedent; the Ishizue API owns its own message format and state machine.
+
+Rationale: research/client-stack-ecosystem.md §12 (W6-E) identifies on-screen keyboards and CJK IMEs as a spec gap for mobile and accessibility, citing Wayland's `zwp_text_input_manager_v3` as the precedent; the original SPEC had no text-input mechanism.
+
+### 6.17 Surface roles
+
+A surface has an optional role attached at creation time. The role tells the library what kind of surface it is and what additional handle it carries. Roles:
+
+- `ISZ_SURFACE_ROLE_NORMAL`: default, no additional handle.
+- `ISZ_SURFACE_ROLE_X11_TOPLEVEL`: the surface represents an X11 top-level window. `role_handle` is the X11 window XID.
+- `ISZ_SURFACE_ROLE_X11_POPUP`: the surface represents an X11 override-redirect popup. `role_handle` is the X11 window XID.
+- `ISZ_SURFACE_ROLE_LAYER`: the surface is a layer-shell surface (§6.7). `role_handle` is the layer enum value.
+
+```c
+int isz_surface_set_role(isz_surface *surf, enum isz_surface_role role, uint64_t role_handle);
+```
+
+The role is set once at surface creation by the client that owns the surface. The X11 bridge (§13) sets `ISZ_SURFACE_ROLE_X11_TOPLEVEL` with the X11 window XID as the role handle, so the library can pair wire-protocol surface IDs with X11 window XIDs at creation time, without a serial-lookup round-trip or an association race. Creating an X11-role surface is a privileged operation gated by the allowlist (§6.3); only the bridge binary may do it. The surface serial (§6.4) remains available as a general cross-subsystem identifier; the role is the X11-specific shortcut.
+
+Rationale: research/wlroots-xwayland-patterns.md §18 (W6-C, finding #2) recommends a native `x11_toplevel` surface role in the protocol so the X11 bridge attaches the XID at creation time, eliminating the WL_SURFACE_ID-vs-WL_SURFACE_SERIAL association race wlroots had to fix with xwayland-shell-v1.
 
 ## 7. Rendering pipeline
 
@@ -279,6 +358,16 @@ int isz_output_set_hdr_metadata(isz_output *out, const isz_hdr_metadata *meta);
 ```
 
 `isz_hdr_metadata` holds either the EDID-parsed `HDR_STATIC_METADATA` blob or an Architect-supplied override. The library serializes it into the KMS `HDR_OUTPUT_METADATA` property; it can be called at any time and takes effect on the next commit.
+
+Fractional scale: integer per-plane scaling (above) does not cover HiDPI outputs where the correct factor is fractional (1.5x, 1.75x). Surfaces request a fractional scale via:
+
+```c
+int isz_surface_set_scale(isz_surface *surf, uint32_t numerator, uint32_t denominator);
+```
+
+The library passes the preferred scale to the client via a `preferred_scale` event so the client renders at the right resolution. The library itself does not composite or rescale; the client owns rendering at the requested scale, and the buffer is scanned out at its native resolution. Cross-reference: Wayland's `wp_fractional_scale_v1`.
+
+Rationale: research/client-stack-ecosystem.md §12 (W6-E) identifies fractional scaling as a spec gap for HiDPI desktops and mobile, citing `wp_fractional_scale_v1`; the original §7.2 had integer per-plane scaling only.
 
 ### 7.3 Frame scheduling
 Damage-tracked, event-driven, never a fixed redraw rate. Detailed scheduling/damage-coalescing implementation is internal to the library and not an Architect-facing policy knob beyond what's listed here.
@@ -488,6 +577,10 @@ Event types (`isz_event`, a union tagged by `isz_event_type`, every event carryi
 - `ISZ_EVENT_CLIENT_CONNECT` / `CLIENT_DISCONNECT`: client lifecycle, post-allowlist.
 - `ISZ_EVENT_INPUT_KEYBOARD_FOCUS_CHANGED`: focus cleared or moved.
 - `ISZ_EVENT_CLIPBOARD_REQUEST`: another client requested clipboard contents (§6.8).
+- `ISZ_EVENT_IDLE_INHIBIT_ACTIVE` / `IDLE_INHIBIT_INACTIVE`: an output's idle-inhibit state changed (§6.15).
+- `ISZ_EVENT_TEXT_INPUT_PREEDIT`: preedit text from the active input method (§6.16).
+- `ISZ_EVENT_TEXT_INPUT_COMMIT`: committed text from the active input method (§6.16).
+- `ISZ_EVENT_TEXT_INPUT_CURSOR_RECTANGLE_NEEDED`: the IME requested the cursor rectangle for the focused text-input (§6.16).
 
 ## 10. Backend abstraction & multi-GPU
 
@@ -545,3 +638,16 @@ Reference development hardware is an Intel N4100 (quad-core, 4GB RAM). This is t
 - Wayland client compatibility (not planned at all, X11 only)
 - Nested backend implementation (interface should allow it, not required now)
 - NVIDIA support (explicitly out of scope, not just deferred)
+
+## 16. Changelog
+
+- 2026-07-18: §6.4: surface serial (64-bit, monotonic, global to server) for cross-subsystem pairing.
+- 2026-07-18: §6.4: surface-role concept added to the v1 object/feature set; details in §6.17.
+- 2026-07-18: §6.8: PRIMARY selection slot per seat, distinct from CLIPBOARD.
+- 2026-07-18: §6.8: selection-ownership timestamp (`CLOCK_MONOTONIC_RAW` nanoseconds) and stale-claim rejection.
+- 2026-07-18: §6.11: portal-consent scope expanded from screen-capture-only to screen capture, file access, notification forwarding, and other portal-style consent; heading renamed from "Screen Capture Permission" to "Portal consent".
+- 2026-07-18: §6.15: idle-inhibit flag (`isz_surface_set_idle_inhibit`) and `ISZ_EVENT_IDLE_INHIBIT_ACTIVE` / `_INACTIVE` events.
+- 2026-07-18: §6.16: text-input and input-method objects (`isz_text_input`, `isz_input_method`) and `ISZ_EVENT_TEXT_INPUT_PREEDIT` / `_COMMIT` / `_CURSOR_RECTANGLE_NEEDED` events.
+- 2026-07-18: §6.17: surface-role enum and `isz_surface_set_role()` covering `ISZ_SURFACE_ROLE_NORMAL`, `_X11_TOPLEVEL`, `_X11_POPUP`, `_LAYER`.
+- 2026-07-18: §7.2: fractional scale via `isz_surface_set_scale(numerator, denominator)` and the `preferred_scale` client event.
+- 2026-07-18: §9: `ISZ_EVENT_IDLE_INHIBIT_ACTIVE` / `_INACTIVE` and `ISZ_EVENT_TEXT_INPUT_PREEDIT` / `_COMMIT` / `_CURSOR_RECTANGLE_NEEDED` added to the `isz_event_type` enum.
