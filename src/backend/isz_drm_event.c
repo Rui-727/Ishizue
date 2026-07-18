@@ -27,7 +27,13 @@
  * via isz_backend_finish_commit). Connector hotplug events trigger a
  * re-enumeration of st->connectors and fire the output hook so the server
  * layer can wrap newly-appeared connectors into isz_output objects and
- * emit ISZ_EVENT_OUTPUT_ADD / OUTPUT_REMOVE. */
+ * emit ISZ_EVENT_OUTPUT_ADD / OUTPUT_REMOVE.
+ *
+ * W5-B: on page-flip, the handler also walks the backend's
+ * in_flight_releases list. For each buffer the just-completed commit was
+ * scanning out, the handler either sends ISZ_MSG_RELEASE immediately
+ * (implicit sync) or moves the buffer to the server's pending_releases
+ * list (explicit sync, polled by isz_buffer_poll_out_fences). */
 #include "isz_drm_event.h"
 #include "isz_drm.h"
 
@@ -35,6 +41,7 @@
 
 #include <ishizue/isz.h>
 #include "../isz_server_internal.h"
+#include "../buffer/isz_buffer.h"
 #include "../util/isz_log.h"
 
 #include <drm.h>
@@ -48,7 +55,12 @@
 
 /* Page-flip event handler. drmHandleEvent calls this when the kernel
  * finishes scanning out the previous frame. The state machine was left
- * at COMMITTING by ops->commit; transition back to READY here. */
+ * at COMMITTING by ops->commit; transition back to READY here.
+ *
+ * W5-B: the user_data pointer is the struct isz_drm_state * we passed
+ * to drmModeAtomicCommit. From it we reach the backend (st->backend)
+ * for isz_backend_finish_commit, and walk st->in_flight_releases to
+ * kick the per-buffer release path. */
 static void page_flip_handler(int fd, unsigned int sequence,
                               unsigned int tv_sec, unsigned int tv_usec,
                               void *user_data)
@@ -57,10 +69,38 @@ static void page_flip_handler(int fd, unsigned int sequence,
     (void)sequence;
     (void)tv_sec;
     (void)tv_usec;
-    struct isz_backend *b = user_data;
-    if (!b)
+    struct isz_drm_state *st = user_data;
+    if (!st)
         return;
-    isz_backend_finish_commit(b);
+
+    /* Finish the state-machine transition first so the backend is
+     * READY for the next commit before we run release bookkeeping. */
+    if (st->backend)
+        isz_backend_finish_commit(st->backend);
+
+    /* W5-B: drain in-flight release entries. Each entry holds one ref;
+     * isz_buffer_on_page_flip either sends ISZ_MSG_RELEASE (implicit
+     * sync) or leaves the buffer on the server's pending_releases list
+     * for isz_buffer_poll_out_fences to handle. We always drop the
+     * in_flight_releases ref. */
+    isz_list_node *node;
+    while ((node = isz_list_pop_front(&st->in_flight_releases)) != NULL) {
+        struct isz_buffer *buf =
+            container_of(node, struct isz_buffer, release_node);
+        buf->release_pending = false;
+        if (st->srv && buf->out_syncobj != 0) {
+            /* Explicit sync: hand the buffer to the pending-release
+             * list for polling. isz_buffer_on_page_flip would just
+             * defer; we skip straight to queuing. */
+            isz_buffer_ref(buf);
+            isz_list_push_back(&st->srv->pending_releases,
+                               &buf->release_node);
+            buf->release_pending = true;
+        } else {
+            isz_buffer_on_page_flip(st->srv, buf);
+        }
+        isz_buffer_unref(buf);
+    }
 }
 
 /* Connector hotplug / property-change handler. drmHandleEvent calls this

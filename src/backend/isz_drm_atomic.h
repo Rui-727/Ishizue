@@ -48,6 +48,7 @@ struct isz_drm_prop_cache {
     uint32_t crtc_active;
     uint32_t crtc_mode_id;
     uint32_t crtc_vrr_enabled;
+    uint32_t crtc_out_fence_ptr;   /* W5-B: CRTC OUT_FENCE_PTR (sync_file fd out) */
     uint32_t connector_crtc_id;
     uint32_t connector_dpms;
     uint32_t plane_fb_id;
@@ -62,6 +63,7 @@ struct isz_drm_prop_cache {
     uint32_t plane_crtc_h;
     uint32_t plane_zpos;
     uint32_t plane_rotation;
+    uint32_t plane_in_fence_fd;   /* W5-B: plane IN_FENCE_FD (sync_file fd in) */
     uint32_t hdr_output_metadata;
     uint32_t degamma_lut;
     uint32_t ctm;

@@ -371,7 +371,14 @@ ssize_t isz_proto_recv_state_read(int fd, struct isz_proto_recv_state *state,
         ssize_t n = recvmsg(fd, &msg, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
-            return -1;  /* EAGAIN falls through here; caller checks errno */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* No more data available right now. Caller waits for
+                 * the next EPOLLIN. Distinct from peer-closed (-1
+                 * with errno != EAGAIN): the conn is healthy, just
+                 * quiescent. */
+                return 0;
+            }
+            return -1;
         }
         if (n == 0) {
             /* Peer closed. Pending state, if any, is abandoned. */

@@ -40,6 +40,7 @@
 #include <stdint.h>
 
 #include "isz_backend.h"
+#include "../util/isz_list.h"
 
 const struct isz_backend_ops *isz_drm_get_ops(void);
 
@@ -96,6 +97,24 @@ struct isz_drm_state {
     bool is_master;
     bool session_active;
     bool atomic_ok;
+
+    /* W5-B: probe result of DRM_CAP_SYNCOBJ at init. False on kernels
+     * or drivers that don't support drm_syncobj; the atomic commit
+     * then skips IN_FENCE_FD / OUT_FENCE_PTR and relies on the DMA-BUF's
+     * implicit fencing per SPEC 11. */
+    bool syncobj_supported;
+
+    /* W5-B: back-pointer to the backend object that owns this state.
+     * Set in isz_drm_init so the page-flip event handler can reach
+     * isz_backend_finish_commit without re-deriving the pointer. */
+    struct isz_backend *backend;
+
+    /* W5-B: buffers scanned out by the most recent commit, awaiting
+     * the page-flip event. The page-flip handler walks this list and
+     * either sends ISZ_MSG_RELEASE (implicit sync) or moves the buffer
+     * to the server's pending_releases list (explicit sync, polled by
+     * isz_buffer_poll_out_fences). The list owns one ref per buffer. */
+    isz_list in_flight_releases;
 
     /* libseat session. NULL when ISHIZUE_HAVE_LIBSEAT is undefined or
      * libseat_open_seat failed (direct open fallback). */

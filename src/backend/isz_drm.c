@@ -146,6 +146,7 @@ int isz_output_get_drm_fd(isz_output *out)
 #include "../isz_server_internal.h"
 #include "../render/isz_surface_internal.h"
 #include "../buffer/isz_buffer.h"
+#include "../buffer/isz_syncobj.h"
 #include "../util/isz_log.h"
 
 #include <drm.h>
@@ -528,6 +529,8 @@ static int isz_drm_init(struct isz_backend *self, void *config)
     st->drm_fd = -1;
     st->vt_fd  = -1;
     st->session_active = true;  /* assume active until libseat says otherwise */
+    st->backend = self;
+    isz_list_init(&st->in_flight_releases);
 
 #ifdef ISHIZUE_HAVE_LIBSEAT
     /* Open a libseat session so drmDropMaster / drmSetMaster on VT
@@ -588,6 +591,20 @@ static int isz_drm_init(struct isz_backend *self, void *config)
     /* Also request universal planes so the plane list includes primary
      * and cursor planes, not just overlays. */
     (void)drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+
+    /* W5-B: probe DRM_CAP_SYNCOBJ for explicit-sync support. Failure
+     * is silent (debug log only) and falls back to the DMA-BUF's
+     * implicit kernel fencing per SPEC 11 fallback matrix. The
+     * syncobj_supported flag is consulted by the atomic commit path
+     * to decide whether to attach IN_FENCE_FD / OUT_FENCE_PTR. */
+    st->syncobj_supported = (isz_syncobj_init(fd) == ISZ_OK);
+
+    /* W5-B: register the fd with the buffer layer so its syncobj
+     * helpers can reach it without each caller threading the fd
+     * through. The buffer layer caches this for the backend's
+     * lifetime; we don't need to clear it on destroy since the
+     * buffer layer treats a stale fd as "no DRM" gracefully. */
+    isz_buffer_set_drm_fd(fd);
 
     /* Snapshot the KMS state. */
     drmModeRes *res = drmModeGetResources(fd);
@@ -672,6 +689,22 @@ static void isz_drm_destroy(struct isz_backend *self)
 
     if (g_drm_state == st)
         g_drm_state = NULL;
+
+    /* W5-B: drop any in-flight release refs the backend still holds.
+     * The server's pending_releases list is drained by
+     * isz_buffer_release_destroy at isz_destroy time; this list holds
+     * buffers awaiting their page-flip event, which can't fire after
+     * the backend is gone. */
+    {
+        isz_list_node *node;
+        while ((node = isz_list_pop_front(&st->in_flight_releases)) != NULL) {
+            struct isz_buffer *buf =
+                container_of(node, struct isz_buffer, release_node);
+            buf->release_pending = false;
+            isz_buffer_release(buf);
+            isz_buffer_unref(buf);
+        }
+    }
 
     for (size_t i = 0; i < st->connector_count; i++)
         free_connector(&st->connectors[i]);

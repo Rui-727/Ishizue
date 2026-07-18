@@ -42,6 +42,8 @@
 #include "../isz_server_internal.h"
 #include "../render/isz_surface_internal.h"
 #include "../util/isz_log.h"
+#include "../buffer/isz_buffer.h"
+#include "../buffer/isz_syncobj.h"
 
 #include <drm.h>
 #include <drm_mode.h>
@@ -50,6 +52,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ------------------------------------------------------------------ */
 /* Property id lookup                                                 */
@@ -92,6 +95,13 @@ static void cache_init(struct isz_drm_prop_cache *c, int drm_fd,
                                                DRM_MODE_OBJECT_CRTC, "MODE_ID");
     c->crtc_vrr_enabled      = isz_drm_prop_id(drm_fd, crtc_id,
                                                DRM_MODE_OBJECT_CRTC, "VRR_ENABLED");
+    /* W5-B: OUT_FENCE_PTR is a CRTC property. The kernel writes a
+     * sync_file fd into the user-space __u64 whose address we pass as
+     * the property value. Cached as a property id; the per-commit
+     * storage for the fd itself is a stack local in isz_drm_atomic_commit. */
+    c->crtc_out_fence_ptr    = isz_drm_prop_id(drm_fd, crtc_id,
+                                               DRM_MODE_OBJECT_CRTC,
+                                               "OUT_FENCE_PTR");
     c->connector_crtc_id     = isz_drm_prop_id(drm_fd, connector_id,
                                                DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
     c->connector_dpms        = isz_drm_prop_id(drm_fd, connector_id,
@@ -121,6 +131,12 @@ static void cache_init(struct isz_drm_prop_cache *c, int drm_fd,
                                                DRM_MODE_OBJECT_PLANE, "zpos");
         c->plane_rotation    = isz_drm_prop_id(drm_fd, primary_plane_id,
                                                DRM_MODE_OBJECT_PLANE, "rotation");
+        /* W5-B: IN_FENCE_FD is a plane property. The value is a
+         * sync_file fd the kernel waits on before scanning out the
+         * plane's new FB. The kernel consumes the fd (takes ownership). */
+        c->plane_in_fence_fd = isz_drm_prop_id(drm_fd, primary_plane_id,
+                                               DRM_MODE_OBJECT_PLANE,
+                                               "IN_FENCE_FD");
     }
     /* Color mgmt + HDR live on the CRTC (DEGAMMA_LUT, CTM, GAMMA_LUT) or
      * connector (HDR_OUTPUT_METADATA). */
@@ -183,6 +199,12 @@ int isz_drm_atomic_commit(struct isz_drm_state *st,
     uint32_t offsets[4] = {0, 0, 0, 0};
     const isz_hdr_metadata *hdr = NULL;
     uint64_t rot = 1u;
+
+    /* W5-B explicit-sync state. */
+    int      in_fence_fd   = -1;  /* exported from buf->in_syncobj, kernel consumes */
+    int32_t  out_fence_fd  = -1;  /* kernel writes here via OUT_FENCE_PTR */
+    bool     out_fence_requested = false;
+    struct isz_buffer *old_buf = NULL;  /* the buffer being replaced */
 
     if (!st || !out)
         return ISZ_ERR_INVALID_ARG;
@@ -333,6 +355,12 @@ int isz_drm_atomic_commit(struct isz_drm_state *st,
             continue;
         if (s->plane_type == ISZ_PLANE_PRIMARY) {
             primary_surf = s;
+            /* W5-B: track the surface's previously-attached buffer so
+             * we can attach this commit's out-fence to it after the
+             * commit succeeds. The out-fence signals when this commit's
+             * flip completes, which is exactly when the old buffer is
+             * no longer being scanned out. */
+            old_buf = s->pending_release;
             break;
         }
     }
@@ -396,10 +424,62 @@ int isz_drm_atomic_commit(struct isz_drm_state *st,
                     (void)drmModeAtomicAddProperty(req, primary_plane_id,
                                                    cache->plane_rotation, rot);
                 }
+
+                /* W5-B: attach the render-GPU's completion fence to
+                 * the plane as IN_FENCE_FD. The kernel consumes the
+                 * fd (takes ownership) and won't scan out the new FB
+                 * until the fence signals. Falls back to implicit
+                 * sync if buf->in_syncobj is 0 or the property isn't
+                 * advertised by the driver. */
+                if (st->syncobj_supported &&
+                    buf->in_syncobj != 0 &&
+                    cache->plane_in_fence_id != 0) {
+                    in_fence_fd = isz_syncobj_export_sync_file(st->drm_fd,
+                                                               buf->in_syncobj);
+                    if (in_fence_fd >= 0) {
+                        (void)drmModeAtomicAddProperty(req,
+                                                       primary_plane_id,
+                                                       cache->plane_in_fence_fd,
+                                                       (uint64_t)in_fence_fd);
+                        /* The kernel takes ownership on a successful
+                         * commit; clear our copy so the cleanup path
+                         * doesn't double-close. If the commit fails we
+                         * close it ourselves in the `out:` label. */
+                    } else {
+                        isz_log_internal(ISZ_LOG_DEBUG,
+                                         "drm atomic: in-fence export failed; "
+                                         "falling back to implicit sync");
+                    }
+                }
             } else {
                 isz_log_internal(ISZ_LOG_WARN,
                                  "drm atomic: drmModeAddFB2 failed");
             }
+        }
+    }
+
+    /* W5-B: request an out-fence from the CRTC. The kernel writes a
+     * sync_file fd into out_fence_fd when the commit takes effect (at
+     * the next vblank). We import that fd into the OLD buffer's
+     * out_syncobj after the commit succeeds, so the page-flip handler
+     * can defer ISZ_MSG_RELEASE until the fence signals.
+     *
+     * Skipped for TEST_ONLY commits (no real flip happens) and when
+     * the driver doesn't expose OUT_FENCE_PTR or syncobj isn't
+     * supported. In those cases the page-flip handler will release
+     * the old buffer immediately on the implicit-sync path. */
+    if (st->syncobj_supported &&
+        !(flags & ISZ_COMMIT_TEST_ONLY) &&
+        cache->crtc_out_fence_ptr != 0) {
+        out_fence_fd = -1;
+        if (drmModeAtomicAddProperty(req, crtc_id,
+                                     cache->crtc_out_fence_ptr,
+                                     (uint64_t)(uintptr_t)&out_fence_fd) >= 0) {
+            out_fence_requested = true;
+        } else {
+            isz_log_internal(ISZ_LOG_DEBUG,
+                             "drm atomic: OUT_FENCE_PTR add failed; "
+                             "implicit sync for release");
         }
     }
 
@@ -424,9 +504,61 @@ int isz_drm_atomic_commit(struct isz_drm_state *st,
         goto out;
     }
 
+    /* W5-B: post-commit explicit-sync bookkeeping. The commit succeeded,
+     * so the kernel has consumed the in-fence fd (if any) and written
+     * the out-fence fd into out_fence_fd (if requested). */
+    if (out_fence_requested && out_fence_fd >= 0) {
+        /* Attach the out-fence to the OLD buffer (the one being
+         * replaced by this commit). The fence signals when this
+         * commit's flip completes, which is exactly when the OLD
+         * buffer is no longer being scanned out. The page-flip
+         * handler will defer ISZ_MSG_RELEASE for this buffer until
+         * the syncobj signals (or the polling path picks it up). */
+        if (old_buf != NULL) {
+            if (old_buf->out_syncobj == 0)
+                old_buf->out_syncobj =
+                    isz_syncobj_create(st->drm_fd);
+            if (old_buf->out_syncobj != 0) {
+                int orc = isz_syncobj_import_sync_file(st->drm_fd,
+                                                       old_buf->out_syncobj,
+                                                       out_fence_fd);
+                if (orc != ISZ_OK) {
+                    isz_log_internal(ISZ_LOG_DEBUG,
+                                     "drm atomic: out-fence import failed; "
+                                     "release will fall back to page-flip event");
+                }
+            }
+        }
+        /* Always close the kernel-provided fd; we have the syncobj
+         * copy now (or we never made one). */
+        close(out_fence_fd);
+        out_fence_fd = -1;
+    }
+
+    /* W5-B: queue the OLD buffer for release tracking. The page-flip
+     * handler walks st->in_flight_releases on the next flip event and
+     * either sends ISZ_MSG_RELEASE immediately (implicit sync) or
+     * defers to isz_buffer_poll_out_fences (explicit sync, gated on
+     * out_syncobj). We hold one ref for the list; the handler drops
+     * it when the buffer is released. */
+    if (old_buf != NULL && !(flags & ISZ_COMMIT_TEST_ONLY)) {
+        isz_buffer_ref(old_buf);
+        isz_list_push_back(&st->in_flight_releases,
+                           &old_buf->release_node);
+        old_buf->release_pending = true;
+    }
+
+    /* The kernel has consumed in_fence_fd on the successful commit
+     * path; clear our handle so the cleanup label doesn't double-close. */
+    in_fence_fd = -1;
+
     rc = ISZ_OK;
 
 out:
+    if (in_fence_fd >= 0)
+        close(in_fence_fd);
+    if (out_fence_fd >= 0)
+        close(out_fence_fd);
     if (blob_mode_id)
         drmModeDestroyPropertyBlob(st->drm_fd, blob_mode_id);
     if (req)

@@ -148,11 +148,10 @@ int isz_handshake_server_side(struct isz_conn *conn)
  * on the connection and return its freshly-allocated 32-bit id. The id
  * is per-connection: the same server-side object may carry different
  * ids on different conns. Returns 0 on allocation failure (callers
- * treat 0 as "no id" since 0 is the sentinel). */
+ * treat 0 as "no id" since 0 is the sentinel). NULL-tolerant on conn. */
 uint32_t isz_conn_register_object(struct isz_conn *conn, void *handle,
                                   int kind)
-    ISZ_INTERNAL
-    __attribute__((nonnull(1)));
+    ISZ_INTERNAL;
 
 /* Look up an object by id. kind is the expected kind (ISZ_OBJECT_SURFACE,
  * ...); a mismatch returns NULL, as does a missing id. NULL-tolerant
