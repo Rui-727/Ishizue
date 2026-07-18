@@ -165,7 +165,7 @@ static void fill_input_event(struct x11_event_32 *ev,
      * clients tolerate this; some use it for double-click detection
      * and will see all clicks as "too fast", which is harmless for
      * the scaffold. */
-    x11_put_u32(ev->root, 1u, xc->byte_order);  /* root window id */
+    x11_put_u32(ev->root, X11_ROOT_WINDOW_ID, xc->byte_order);
     x11_put_u32(ev->event, win->x11_id, xc->byte_order);
     x11_put_u32(ev->child, 0u, xc->byte_order);  /* no child */
     x11_put_u16(ev->event_x, (uint16_t)win->w, xc->byte_order);

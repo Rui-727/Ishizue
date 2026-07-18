@@ -4,14 +4,10 @@
 
 /* x11_proto.h: minimal X11 wire protocol constants and structs.
  *
- * From scratch, no libX11 or libXCB. Just enough to:
- *   - parse a client setup_request
- *   - reply with a minimal setup_success
- *   - parse a 4-byte request header (opcode + length)
- *   - emit a minimal 32-byte X11 event for input translation
- *
- * The bridge is not an X server. It parses what it needs and stubs
- * the rest. See x11bridge/README.md for the long list of limitations. */
+ * From scratch, no libX11 or libXCB. The bridge parses raw X11 bytes
+ * off /tmp/.X11-unix/X<n> and emits raw X11 replies/errors/events.
+ * See x11bridge/README.md and doc/research/x11-protocol-internals.md
+ * for the wire layout reference. */
 
 #ifndef X11_PROTO_H
 #define X11_PROTO_H
@@ -28,7 +24,39 @@
 #define X11_SETUP_AUTHENTICATE 2u
 #define X11_SETUP_SUCCESS      1u
 
-/* Request major opcodes (the subset the bridge cares about). */
+/* Predefined XIDs and pixel values. The bridge picks these once and
+ * uses them in every SetupSuccess. Root, visual, colormap, etc. must
+ * sit below the per-client resource-id-base so client-allocated XIDs
+ * never collide with them. */
+#define X11_ROOT_WINDOW_ID     0x00000100u
+#define X11_ROOT_VISUAL_ID     0x00000021u
+#define X11_DEFAULT_COLORMAP   0x00000022u
+#define X11_BLACK_PIXEL        0x00000000u
+#define X11_WHITE_PIXEL        0x00FFFFFFu
+
+/* Per-client XID range layout. Each connecting client gets a slice of
+ * the 32-bit XID space: base = X11_XID_BASE_FIRST + slot * stride,
+ * mask = X11_XID_MASK. The slot is the connection index, incremented
+ * per accepted client. The mask leaves 21 bits for the per-client
+ * counter, so each client has ~2M XIDs before exhausting its range. */
+#define X11_XID_BASE_FIRST     0x40000000u
+#define X11_XID_STRIDE         0x00200000u
+#define X11_XID_MASK           0x001FFFFFu
+
+/* Default screen geometry advertised in SetupSuccess. The bridge is a
+ * separate process and does not know the real Ishizue output geometry
+ * at setup time, so it picks a default. Real X clients read these
+ * to size their top-level windows. */
+#define X11_DEFAULT_ROOT_W     1024u
+#define X11_DEFAULT_ROOT_H     768u
+#define X11_DEFAULT_ROOT_W_MM  200u
+#define X11_DEFAULT_ROOT_H_MM  150u
+
+/* X11 protocol release number advertised in SetupSuccess. The bridge
+ * picks the same number Xorg ships, so version-checking clients pass. */
+#define X11_RELEASE_NUMBER     11800000u
+
+/* Request major opcodes the bridge actually handles in W7. */
 enum x11_request {
     X11_REQ_CREATE_WINDOW        = 1,
     X11_REQ_CHANGE_WINDOW_ATTRS  = 2,
@@ -37,10 +65,51 @@ enum x11_request {
     X11_REQ_MAP_WINDOW           = 8,
     X11_REQ_UNMAP_WINDOW         = 10,
     X11_REQ_CONFIGURE_WINDOW     = 12,
+    X11_REQ_GET_GEOMETRY         = 14,
     X11_REQ_INTERN_ATOM          = 16,
     X11_REQ_CHANGE_PROPERTY      = 18,
     X11_REQ_GET_INPUT_FOCUS      = 43,
     X11_REQ_QUERY_EXTENSION      = 98,
+};
+
+/* CreateWindow value-mask bits (X11 protocol spec, low bit first). The
+ * value-list that follows the mask carries one 4-byte slot per set
+ * bit, in this order. */
+#define X11_CW_BG_PIXMAP         0x00000001u
+#define X11_CW_BG_PIXEL          0x00000002u
+#define X11_CW_BORDER_PIXMAP     0x00000004u
+#define X11_CW_BORDER_PIXEL      0x00000008u
+#define X11_CW_BIT_GRAVITY       0x00000010u
+#define X11_CW_WIN_GRAVITY       0x00000020u
+#define X11_CW_BACKING_STORE     0x00000040u
+#define X11_CW_BACKING_PLANES    0x00000080u
+#define X11_CW_BACKING_PIXEL     0x00000100u
+#define X11_CW_OVERRIDE_REDIRECT 0x00000200u
+#define X11_CW_SAVE_UNDER        0x00000400u
+#define X11_CW_EVENT_MASK        0x00000800u
+#define X11_CW_DONT_PROPAGATE    0x00001000u
+#define X11_CW_COLORMAP          0x00002000u
+#define X11_CW_CURSOR            0x00004000u
+
+/* X11 error codes (from the protocol spec). */
+enum x11_error_code {
+    X11_ERR_REQUEST        = 1,
+    X11_ERR_VALUE          = 2,
+    X11_ERR_WINDOW         = 3,
+    X11_ERR_PIXMAP         = 4,
+    X11_ERR_ATOM           = 5,
+    X11_ERR_CURSOR         = 6,
+    X11_ERR_FONT           = 7,
+    X11_ERR_MATCH          = 8,
+    X11_ERR_DRAWABLE       = 9,
+    X11_ERR_ACCESS         = 10,
+    X11_ERR_ALLOC          = 11,
+    X11_ERR_COLORMAP       = 12,
+    X11_ERR_GCONTEXT       = 13,
+    X11_ERR_IDCHOICE       = 14,
+    X11_ERR_NAME           = 15,
+    X11_ERR_LENGTH         = 16,
+    X11_ERR_IMPLEMENTATION = 17,
 };
 
 /* Event codes (first byte of an X11 event). */
@@ -129,6 +198,26 @@ struct x11_root_screen {
     uint8_t  depths_len;
 };
 
+/* DEPTH entry: 8-byte header + 24-byte VISUALTYPE per visual. */
+struct x11_depth {
+    uint8_t  depth;
+    uint8_t  pad1;
+    uint8_t  visuals_len[2];
+    uint8_t  pad2[4];
+};
+
+struct x11_visualtype {
+    uint8_t  visual_id[4];
+    uint8_t  class_;
+    uint8_t  pad1;
+    uint8_t  colormap_entries[2];
+    uint8_t  red_mask[4];
+    uint8_t  green_mask[4];
+    uint8_t  blue_mask[4];
+    uint8_t  bits_per_rgb_value;
+    uint8_t  pad2[3];
+};
+
 struct x11_request_header {
     uint8_t  major_opcode;
     uint8_t  data;
@@ -160,6 +249,8 @@ _Static_assert(sizeof(struct x11_setup_request)  == 12, "x11_setup_request layou
 _Static_assert(sizeof(struct x11_setup_success)  == 40, "x11_setup_success layout");
 _Static_assert(sizeof(struct x11_pixmap_format)  == 8,  "x11_pixmap_format layout");
 _Static_assert(sizeof(struct x11_root_screen)    == 40, "x11_root_screen layout");
+_Static_assert(sizeof(struct x11_depth)          == 8,  "x11_depth layout");
+_Static_assert(sizeof(struct x11_visualtype)     == 24, "x11_visualtype layout");
 _Static_assert(sizeof(struct x11_request_header) == 4,  "x11_request_header layout");
 _Static_assert(sizeof(struct x11_event_32)       == 32, "x11_event_32 layout");
 
@@ -173,15 +264,44 @@ void     x11_put_u32(uint8_t *p, uint32_t v, uint8_t byte_order);
 /* Pad n up to a multiple of 4. */
 size_t   x11_pad4(size_t n);
 
-/* Build a minimal setup_success into out_buf. Returns total bytes
- * written, or 0 if out_cap is too small. The reply contains: empty
- * vendor, one pixmap format (depth 24, bpp 32, pad 32), one root
- * screen (1024x768, root id 1, root visual id 1, root depth 24, no
- * depths). This gets a real X11 client past connection setup; later
- * requests that depend on visuals/depths will fail. */
+/* Build a real SetupSuccess into out_buf. The reply contains:
+ *   - 40-byte fixed header
+ *   - vendor string (padded to 4)
+ *   - 3 pixmap formats: depth 1 (bpp 1), depth 24 (bpp 32), depth 32
+ *     (bpp 32), all scanline-pad 32
+ *   - 1 root screen with 1 allowed-depth (24) and 1 TrueColor visual
+ * Total size = 40 + 8 + 24 + 72 = 144 bytes.
+ *
+ * The caller passes in the per-client resource_id_base and
+ * resource_id_mask so each connecting client gets its own XID range.
+ * vendor must be non-NULL and NUL-terminated; only the first 252
+ * bytes are used (so vendor_len fits in a u16 with padding headroom).
+ *
+ * Returns total bytes written, or 0 if out_cap is too small or vendor
+ * is too long. */
 size_t   x11_build_setup_success(uint8_t *out_buf, size_t out_cap,
                                  uint8_t client_byte_order,
                                  uint16_t server_proto_major,
-                                 uint16_t server_proto_minor);
+                                 uint16_t server_proto_minor,
+                                 uint32_t resource_id_base,
+                                 uint32_t resource_id_mask,
+                                 const char *vendor);
+
+/* Build a 32-byte X11 error event. Errors are always 32 bytes. */
+size_t   x11_build_error(uint8_t *out_buf, uint8_t error_code,
+                         uint16_t sequence, uint32_t bad_value,
+                         uint8_t major_opcode, uint8_t minor_opcode,
+                         uint8_t byte_order);
+
+/* Build a 32-byte GetGeometry reply. reply-length is 0 (no extra
+ * data). depth is the window's depth; root_xid is the root window the
+ * drawable lives on (X11_ROOT_WINDOW_ID for top-level windows). */
+size_t   x11_build_get_geometry_reply(uint8_t *out_buf,
+                                      uint8_t depth, uint32_t root_xid,
+                                      int16_t x, int16_t y,
+                                      uint16_t width, uint16_t height,
+                                      uint16_t border_width,
+                                      uint16_t sequence,
+                                      uint8_t byte_order);
 
 #endif /* X11_PROTO_H */

@@ -65,9 +65,10 @@
 #define X11_MAX_CLIENTS    32
 
 static volatile sig_atomic_t g_exit = 0;
+static volatile sig_atomic_t g_last_signo = 0;
 
 static void on_signal(int signo) {
-    (void)signo;
+    g_last_signo = signo;
     g_exit = 1;
 }
 
@@ -125,7 +126,7 @@ static int open_x11_listen(int display) {
     /* Remove any stale socket file. */
     (void)unlink(path);
 
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) {
         log_msg("error", "socket: %s", strerror(errno));
         return -1;
@@ -213,7 +214,7 @@ static size_t build_clients_array(struct x11_client **out, size_t cap) {
 /* ------------------------------------------------------------------ */
 /* Accept an X11 client connection. */ 
 /* ------------------------------------------------------------------ */
-static void on_x11_accept(int epoll_fd, int listen_fd) {
+static void on_x11_accept(int epoll_fd, int listen_fd, struct isz_client *isz) {
     for (;;) {
         int fd = accept4(listen_fd, NULL, NULL,
                          SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -235,6 +236,38 @@ static void on_x11_accept(int epoll_fd, int listen_fd) {
         if (s == NULL) {
             log_msg("warn", "client table full; rejecting fd=%d", fd);
             x11_client_destroy(c);
+            continue;
+        }
+
+        /* Run the X11 connection setup handshake synchronously here,
+         * with the socket switched to blocking mode. The setup is
+         * small (12 bytes in + a few hundred bytes out) and runs
+         * once per connection, so blocking is fine. After setup we
+         * switch back to non-blocking for epoll-driven request
+         * parsing. This mirrors the Ishizue server's pattern
+         * (isz_listen.c). */
+        int blk_flags = fcntl(fd, F_GETFL, 0);
+        if (blk_flags < 0 ||
+            fcntl(fd, F_SETFL, blk_flags & ~O_NONBLOCK) < 0) {
+            log_msg("warn", "fcntl blocking: %s", strerror(errno));
+            x11_client_destroy(c);
+            slot_free(s);
+            continue;
+        }
+
+        int rc = x11_client_drain(c, isz);
+        if (rc < 0) {
+            log_msg("info", "X11 client fd=%d setup failed", fd);
+            x11_client_destroy(c);
+            slot_free(s);
+            continue;
+        }
+
+        /* Switch back to non-blocking for epoll-driven I/O. */
+        if (fcntl(fd, F_SETFL, blk_flags | O_NONBLOCK) < 0) {
+            log_msg("warn", "fcntl non-blocking: %s", strerror(errno));
+            x11_client_destroy(c);
+            slot_free(s);
             continue;
         }
 
@@ -371,6 +404,7 @@ int main(int argc, char **argv) {
     /* Ignore SIGPIPE so a send to a closed X11 socket just returns
      * EPIPE instead of killing the bridge. */
     signal(SIGPIPE, SIG_IGN);
+    log_msg("info", "bridge pid=%d ppid=%d", (int)getpid(), (int)getppid());
 
     const char *isz_path = getenv("ISZ_SOCKET");
     if (isz_path == NULL || isz_path[0] == '\0') {
@@ -428,9 +462,11 @@ int main(int argc, char **argv) {
 
     log_msg("info", "bridge ready; ISZ_SOCKET=%s X11=:%d",
             isz_path, display);
+    log_msg("debug", "entering main loop g_exit=%d", (int)g_exit);
 
     while (!g_exit) {
         struct epoll_event events[16];
+        log_msg("debug", "calling epoll_wait g_exit=%d", (int)g_exit);
         int n = epoll_wait(epoll_fd, events,
                            (int)(sizeof(events) / sizeof(events[0])),
                            -1);
@@ -439,6 +475,7 @@ int main(int argc, char **argv) {
             log_msg("error", "epoll_wait: %s", strerror(errno));
             break;
         }
+        log_msg("debug", "epoll_wait returned n=%d g_exit=%d", n, (int)g_exit);
         for (int i = 0; i < n && !g_exit; i++) {
             struct fd_tag *t = (struct fd_tag *)events[i].data.ptr;
             if (t == NULL) continue;
@@ -447,7 +484,7 @@ int main(int argc, char **argv) {
                 on_isz_ready(isz);
                 break;
             case FD_X11_LISTEN:
-                on_x11_accept(epoll_fd, x11_listen);
+                on_x11_accept(epoll_fd, x11_listen, isz);
                 break;
             case FD_X11_CLIENT:
                 on_x11_client_ready(epoll_fd, isz,
@@ -459,7 +496,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    log_msg("info", "shutting down");
+    log_msg("info", "shutting down (last_signo=%d)", (int)g_last_signo);
     /* Tear down X11 clients. */
     for (int i = 0; i < X11_MAX_CLIENTS; i++) {
         if (g_slots[i].c != NULL) {

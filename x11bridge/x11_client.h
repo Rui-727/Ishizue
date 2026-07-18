@@ -6,13 +6,15 @@
  *
  * One of these is created when an X11 client connects to the bridge's
  * listening socket. It owns the per-client socket fd, the client's
- * chosen byte order, the sequence counter for replies, a partial-read
- * buffer for incomplete requests, and a small table mapping X11
- * top-level window ids to Ishizue surface handles.
+ * chosen byte order, the per-client XID range (resource-id-base +
+ * resource-id-mask), the sequence counter, a partial-read buffer for
+ * incomplete requests, and a small table mapping X11 window ids to
+ * bridge-tracked window state.
  *
- * The bridge parses the X11 connection setup, replies with a minimal
- * setup_success (x11_proto.c), then reads request frames one at a
- * time and routes the few it understands to translation.c. */
+ * W7-C: the bridge now completes the X11 connection setup handshake
+ * for real, parses CreateWindow's value-list, and answers GetGeometry.
+ * Other opcodes are accepted and silently dropped (with a debug log)
+ * so a client that probes extensions does not stall the connection. */
 
 #ifndef X11_CLIENT_H
 #define X11_CLIENT_H
@@ -31,6 +33,13 @@ struct x11_window {
     uint32_t  isz_surface_id;  /* bridge-allocated Ishizue surface id */
     int32_t   x, y;
     int32_t   w, h;
+    uint16_t  border_width;
+    uint8_t   depth;
+    uint8_t   window_class;    /* 0 CopyFromParent, 1 InputOutput, 2 InputOnly */
+    uint32_t  visual_id;
+    uint32_t  event_mask;      /* X11 SETofEVENT the client asked for */
+    uint32_t  parent_xid;      /* root for top-level, real parent otherwise */
+    bool      override_redirect;
     bool      mapped;
     bool      in_use;
 };
@@ -41,14 +50,22 @@ struct x11_client {
     uint8_t  byte_order;          /* X11_BYTE_ORDER_LSB or _MSB */
     uint16_t sequence;            /* next reply/event sequence number */
 
+    /* Per-client XID range, advertised in SetupSuccess. The client
+     * allocates its own XIDs via (base | (counter++ & mask)). The
+     * bridge tracks the same (base, mask) so it can sanity-check
+     * client-chosen XIDs (currently advisory only). */
+    uint32_t xid_base;
+    uint32_t xid_mask;
+    uint32_t next_xid;            /* bridge-side counter (currently unused) */
+
     /* Partial-read buffer. Requests come in 4-byte units; we
      * accumulate bytes here until we have at least one full request,
      * then dispatch and shift. */
     uint8_t  buf[X11_CLIENT_RECV_BUF];
     size_t   have;                /* valid bytes in buf */
 
-    /* Window table: X11 window id -> Ishizue surface id. The bridge
-     * only tracks top-level windows (parent == root). */
+    /* Window table: X11 window id -> bridge state. Indexed by slot;
+     * linear scan on lookup. v1 client window counts are small. */
     struct x11_window windows[X11_CLIENT_MAX_WIN];
 };
 

@@ -16,12 +16,16 @@
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
  * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
 
-/* x11_proto.c: minimal X11 wire protocol primitives. */
+/* x11_proto.c: minimal X11 wire protocol primitives.
+ *
+ * W7-C: real SetupSuccess with vendor string, three pixmap formats,
+ * one root screen, one depth (24) with one TrueColor visual. Real
+ * error event builder. Real GetGeometry reply builder. */
 
 #include "x11_proto.h"
 
@@ -73,38 +77,62 @@ size_t x11_pad4(size_t n) {
     return (n + 3u) & ~(size_t)3u;
 }
 
+/* Layout produced by x11_build_setup_success:
+ *
+ *   offset 0   : x11_setup_success (40 bytes)
+ *   offset 40  : vendor string, padded to 4 (vendor_len bytes)
+ *   offset 40+v: 3 x11_pixmap_format entries (24 bytes total)
+ *   offset 64+v: 1 x11_root_screen (40 bytes)
+ *   offset 104+v: 1 x11_depth (8 bytes) + 1 x11_visualtype (24 bytes) = 32 bytes
+ *
+ * where v = x11_pad4(strlen(vendor)).
+ *
+ * For vendor "Ishizue" (7 bytes), v = 8, total = 40 + 8 + 24 + 40 + 32 = 144.
+ *
+ * The length field counts 4-byte units after the first 8 bytes, so
+ * length = (total - 8) / 4. */
 size_t x11_build_setup_success(uint8_t *out_buf, size_t out_cap,
                                uint8_t client_byte_order,
                                uint16_t server_proto_major,
-                               uint16_t server_proto_minor) {
-    /* Layout: 40-byte fixed header + 0-byte vendor + 1 pixmap format
-     * (8 bytes) + 1 root screen (40 bytes) = 88 bytes total. The
-     * length field counts 4-byte units after the first 8 bytes, so
-     * length = (88 - 8) / 4 = 20. */
-    const size_t total = sizeof(struct x11_setup_success) +
-                         sizeof(struct x11_pixmap_format) +
-                         sizeof(struct x11_root_screen);
+                               uint16_t server_proto_minor,
+                               uint32_t resource_id_base,
+                               uint32_t resource_id_mask,
+                               const char *vendor) {
+    if (vendor == NULL) {
+        return 0;
+    }
+    size_t vlen = strlen(vendor);
+    if (vlen > 252u) {
+        return 0;  /* vendor_len is u16; cap well below to leave padding headroom */
+    }
+    size_t vpad = x11_pad4(vlen);
+
+    const size_t hdr_size     = sizeof(struct x11_setup_success);
+    const size_t fmts_size    = 3u * sizeof(struct x11_pixmap_format);
+    const size_t root_size    = sizeof(struct x11_root_screen);
+    const size_t depth_size   = sizeof(struct x11_depth) + sizeof(struct x11_visualtype);
+    const size_t total = hdr_size + vpad + fmts_size + root_size + depth_size;
+
     if (out_cap < total) {
         return 0;
     }
 
     memset(out_buf, 0, total);
 
-    struct x11_setup_success *hdr =
-        (struct x11_setup_success *)out_buf;
+    /* Fixed header. */
+    struct x11_setup_success *hdr = (struct x11_setup_success *)out_buf;
     hdr->status              = X11_SETUP_SUCCESS;
     x11_put_u16(hdr->proto_major, server_proto_major, client_byte_order);
     x11_put_u16(hdr->proto_minor, server_proto_minor, client_byte_order);
-    x11_put_u16(hdr->length, (uint16_t)((total - 8u) / 4u),
-                client_byte_order);
-    x11_put_u32(hdr->release_number, 0u, client_byte_order);
-    x11_put_u32(hdr->resource_id_base, 1u, client_byte_order);
-    x11_put_u32(hdr->resource_id_mask, 0x00FFFFFFu, client_byte_order);
+    x11_put_u16(hdr->length, (uint16_t)((total - 8u) / 4u), client_byte_order);
+    x11_put_u32(hdr->release_number, X11_RELEASE_NUMBER, client_byte_order);
+    x11_put_u32(hdr->resource_id_base, resource_id_base, client_byte_order);
+    x11_put_u32(hdr->resource_id_mask, resource_id_mask, client_byte_order);
     x11_put_u32(hdr->motion_buffer_size, 0u, client_byte_order);
-    x11_put_u16(hdr->vendor_len, 0u, client_byte_order);
+    x11_put_u16(hdr->vendor_len, (uint16_t)vlen, client_byte_order);
     x11_put_u16(hdr->max_request_length, 0xFFFFu, client_byte_order);
     hdr->roots_len            = 1;
-    hdr->pixmap_formats_len   = 1;
+    hdr->pixmap_formats_len   = 3;
     hdr->image_byte_order     =
         (client_byte_order == X11_BYTE_ORDER_MSB) ? 1u : 0u;
     hdr->bitmap_bit_order     = hdr->image_byte_order;
@@ -113,33 +141,106 @@ size_t x11_build_setup_success(uint8_t *out_buf, size_t out_cap,
     hdr->min_keycode          = 8;
     hdr->max_keycode          = 255;
 
-    /* Pixmap format: depth 24, 32 bits per pixel, scanline pad 32. */
-    struct x11_pixmap_format *fmt =
-        (struct x11_pixmap_format *)(out_buf + sizeof(struct x11_setup_success));
-    fmt->depth          = 24;
-    fmt->bits_per_pixel = 32;
-    fmt->scanline_pad   = 32;
+    /* Vendor string. */
+    if (vlen > 0) {
+        memcpy(out_buf + hdr_size, vendor, vlen);
+    }
+
+    /* Pixmap formats: depth 1 (1 bpp), depth 24 (32 bpp), depth 32 (32 bpp). */
+    uint8_t *fmts = out_buf + hdr_size + vpad;
+    {
+        struct x11_pixmap_format *f1 = (struct x11_pixmap_format *)(fmts + 0);
+        f1->depth          = 1;
+        f1->bits_per_pixel = 1;
+        f1->scanline_pad   = 32;
+    }
+    {
+        struct x11_pixmap_format *f2 = (struct x11_pixmap_format *)(fmts + 8);
+        f2->depth          = 24;
+        f2->bits_per_pixel = 32;
+        f2->scanline_pad   = 32;
+    }
+    {
+        struct x11_pixmap_format *f3 = (struct x11_pixmap_format *)(fmts + 16);
+        f3->depth          = 32;
+        f3->bits_per_pixel = 32;
+        f3->scanline_pad   = 32;
+    }
 
     /* Root screen. */
-    struct x11_root_screen *root =
-        (struct x11_root_screen *)(out_buf + sizeof(struct x11_setup_success) +
-                                             sizeof(struct x11_pixmap_format));
-    x11_put_u32(root->root_window_id, 1u, client_byte_order);
-    x11_put_u32(root->default_colormap, 0u, client_byte_order);
-    x11_put_u32(root->white_pixel, 0x00FFFFFFu, client_byte_order);
-    x11_put_u32(root->black_pixel, 0u, client_byte_order);
+    uint8_t *rootp = fmts + fmts_size;
+    struct x11_root_screen *root = (struct x11_root_screen *)rootp;
+    x11_put_u32(root->root_window_id, X11_ROOT_WINDOW_ID, client_byte_order);
+    x11_put_u32(root->default_colormap, X11_DEFAULT_COLORMAP, client_byte_order);
+    x11_put_u32(root->white_pixel, X11_WHITE_PIXEL, client_byte_order);
+    x11_put_u32(root->black_pixel, X11_BLACK_PIXEL, client_byte_order);
     x11_put_u32(root->current_input_masks, 0u, client_byte_order);
-    x11_put_u16(root->width_px, 1024u, client_byte_order);
-    x11_put_u16(root->height_px, 768u, client_byte_order);
-    x11_put_u16(root->width_mm, 200u, client_byte_order);
-    x11_put_u16(root->height_mm, 150u, client_byte_order);
+    x11_put_u16(root->width_px, X11_DEFAULT_ROOT_W, client_byte_order);
+    x11_put_u16(root->height_px, X11_DEFAULT_ROOT_H, client_byte_order);
+    x11_put_u16(root->width_mm, X11_DEFAULT_ROOT_W_MM, client_byte_order);
+    x11_put_u16(root->height_mm, X11_DEFAULT_ROOT_H_MM, client_byte_order);
     x11_put_u16(root->min_installed_maps, 1u, client_byte_order);
     x11_put_u16(root->max_installed_maps, 1u, client_byte_order);
-    x11_put_u32(root->root_visual_id, 1u, client_byte_order);
-    root->backing_stores = 0;
+    x11_put_u32(root->root_visual_id, X11_ROOT_VISUAL_ID, client_byte_order);
+    root->backing_stores = 2u;  /* Always */
     root->save_unders    = 0;
     root->root_depth     = 24;
-    root->depths_len     = 0;
+    root->depths_len     = 1;
+
+    /* Depth 24 with one TrueColor visual. */
+    uint8_t *depthp = rootp + root_size;
+    struct x11_depth *d = (struct x11_depth *)depthp;
+    d->depth = 24;
+    x11_put_u16(d->visuals_len, 1u, client_byte_order);
+
+    struct x11_visualtype *vt =
+        (struct x11_visualtype *)(depthp + sizeof(struct x11_depth));
+    x11_put_u32(vt->visual_id, X11_ROOT_VISUAL_ID, client_byte_order);
+    vt->class_ = 2u;  /* TrueColor */
+    x11_put_u16(vt->colormap_entries, 256u, client_byte_order);
+    x11_put_u32(vt->red_mask,   0x00FF0000u, client_byte_order);
+    x11_put_u32(vt->green_mask, 0x0000FF00u, client_byte_order);
+    x11_put_u32(vt->blue_mask,  0x000000FFu, client_byte_order);
+    vt->bits_per_rgb_value = 8;
 
     return total;
+}
+
+size_t x11_build_error(uint8_t *out_buf, uint8_t error_code,
+                       uint16_t sequence, uint32_t bad_value,
+                       uint8_t major_opcode, uint8_t minor_opcode,
+                       uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = 0u;  /* error indicator */
+    out_buf[1] = error_code;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, bad_value, byte_order);
+    out_buf[8]  = minor_opcode;
+    out_buf[9]  = major_opcode;
+    /* bytes 10..31 unused (already zeroed). */
+    return 32;
+}
+
+size_t x11_build_get_geometry_reply(uint8_t *out_buf,
+                                    uint8_t depth, uint32_t root_xid,
+                                    int16_t x, int16_t y,
+                                    uint16_t width, uint16_t height,
+                                    uint16_t border_width,
+                                    uint16_t sequence,
+                                    uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = 1u;  /* reply indicator */
+    out_buf[1] = depth;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, 0u, byte_order);  /* reply length = 0 */
+    x11_put_u32(out_buf + 8, root_xid, byte_order);
+    x11_put_u16(out_buf + 12, (uint16_t)x, byte_order);
+    x11_put_u16(out_buf + 14, (uint16_t)y, byte_order);
+    x11_put_u16(out_buf + 16, width, byte_order);
+    x11_put_u16(out_buf + 18, height, byte_order);
+    x11_put_u16(out_buf + 20, border_width, byte_order);
+    /* bytes 22..31 unused (already zeroed). */
+    return 32;
 }

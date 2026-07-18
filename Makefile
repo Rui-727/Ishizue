@@ -130,6 +130,21 @@ test check:
 	    CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -g3 -O0 -I../include -I../src/input -DISHIZUE_ENABLE_TEST_HOOKS" \
 	    LDFLAGS="-L../$(TEST_BUILD_DIR) -Wl,-rpath,$$(pwd)/$(TEST_BUILD_DIR) -lishizue" \
 	    run
+	@# Build the x11bridge binary against the test build of libishizue.
+	@# Override BRIDGE_LDLIBS / TEST_LDLIBS / TEST_RPATH so both the
+	@# bridge and the integration test link against build-test/.
+	@$(MAKE) -C x11bridge clean
+	@$(MAKE) -C x11bridge \
+	    CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O2 -g" \
+	    LDFLAGS="" \
+	    BRIDGE_LDLIBS="-L../$(TEST_BUILD_DIR) -Wl,-rpath,$$(pwd)/$(TEST_BUILD_DIR) -lishizue" \
+	    TEST_LDLIBS="-L../$(TEST_BUILD_DIR) -Wl,-rpath,$$(pwd)/$(TEST_BUILD_DIR) -lishizue" \
+	    TEST_RPATH="$$(pwd)/$(TEST_BUILD_DIR)" \
+	    all
+	@echo "--- running test_x11_handshake ---"
+	@ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+	    LD_LIBRARY_PATH=$$(pwd)/$(TEST_BUILD_DIR):$$LD_LIBRARY_PATH \
+	    ./x11bridge/tests/test_x11_handshake
 	@rm -rf $(TEST_BUILD_DIR)
 
 install: all
