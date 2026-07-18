@@ -65,12 +65,18 @@ static void isz_nested_dump(const struct isz_backend *self, FILE *fp)
     fprintf(fp, "  nested: stub (not yet implemented)\n");
 }
 
+static void isz_nested_blank_all_crtcs(struct isz_backend *self)
+{
+    (void)self;
+}
+
 static const struct isz_backend_ops isz_nested_ops = {
-    .init        = isz_nested_init,
-    .commit      = isz_nested_commit,
-    .read_events = isz_nested_read_events,
-    .destroy     = isz_nested_destroy,
-    .dump        = isz_nested_dump,
+    .init            = isz_nested_init,
+    .commit          = isz_nested_commit,
+    .read_events     = isz_nested_read_events,
+    .destroy         = isz_nested_destroy,
+    .dump            = isz_nested_dump,
+    .blank_all_crtcs = isz_nested_blank_all_crtcs,
 };
 
 const struct isz_backend_ops *isz_nested_get_ops(void)

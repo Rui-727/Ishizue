@@ -96,6 +96,13 @@ enum isz_backend_state {
  *
  *   dump(self, fp)
  *     Write a human-readable snapshot to fp for diagnostics. May be NULL.
+ *
+ *   blank_all_crtcs(self)
+ *     Disable scanout on every CRTC the backend owns. Called from the
+ *     section 12 crash handler so an Architect-installed crash reporter
+ *     further down the chain sees a black screen instead of a frozen
+ *     last frame. Async-signal-safe: no malloc, no logging, no mutexes.
+ *     May be NULL (the dispatcher tolerates it). For headless: no-op.
  */
 struct isz_backend_ops {
     int  (*init)(struct isz_backend *self, void *config);
@@ -104,6 +111,7 @@ struct isz_backend_ops {
     int  (*read_events)(struct isz_backend *self);
     void (*destroy)(struct isz_backend *self);
     void (*dump)(const struct isz_backend *self, FILE *fp);
+    void (*blank_all_crtcs)(struct isz_backend *self);
 };
 
 struct isz_backend {

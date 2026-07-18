@@ -77,6 +77,25 @@ enum isz_server_state {
 };
 
 /* ------------------------------------------------------------------ */
+/* Epoll fd tagging (SPEC §5)                                         */
+/* ------------------------------------------------------------------ */
+/* Every fd the library adds to its epoll set carries one of these
+ * tags in epoll_data.ptr. isz_dispatch reads the tag to route the
+ * ready event to the right handler without walking a list. */
+enum isz_fd_kind {
+    ISZ_FD_LISTEN  = 0,  /* the Architect-supplied UDS listen socket */
+    ISZ_FD_CLIENT  = 1,  /* a connected client socket */
+    ISZ_FD_PSI     = 2,  /* /sys/kernel/mm/pressure/memory trigger fd */
+    ISZ_FD_BACKEND = 3,  /* backend-provided fd (DRM page-flip, etc.) */
+};
+
+struct isz_fd_tag {
+    enum isz_fd_kind kind;
+    void            *opaque;  /* struct isz_client * for ISZ_FD_CLIENT;
+                               * NULL for the other kinds. */
+};
+
+/* ------------------------------------------------------------------ */
 /* Listener registry (SPEC §5)                                        */
 /* ------------------------------------------------------------------ */
 /* One intrusive list per event_type. Listeners fire in registration
@@ -120,6 +139,7 @@ struct isz_client {
     struct isz_conn     *conn;
     pid_t                peer_pid;
     struct isz_buffer_cache buffer_cache;
+    struct isz_fd_tag    tag;       /* epoll routing tag for this client */
     isz_list_node        node;
 };
 
@@ -200,6 +220,12 @@ struct isz_output {
     enum isz_dpms_state  dpms;
     bool                 enabled;
 
+    /* SPEC §10 / §7.10: set true when the backend fires the output-
+     * remove hook. isz_commit returns ISZ_ERR_OUTPUT_DISCONNECTED
+     * while this is set; the wrapper stays allocated until the
+     * Architect calls isz_output_destroy. */
+    bool                 disconnected;
+
     /* Plane slots (SPEC §7.7). */
     struct isz_output_plane_slot *slots;
     size_t                        slot_count;
@@ -267,6 +293,13 @@ struct isz_server {
      * waves add fds to it. */
     int                     epoll_fd;
 
+    /* §6.1: the Architect hands a bound+listening UDS fd to the
+     * library via isz_listen. -1 until that call. */
+    int                     listen_fd;
+    struct isz_fd_tag       listen_tag;
+    struct isz_fd_tag       psi_tag;
+    struct isz_fd_tag       backend_tag;
+
     /* Logging. The runtime filter lives in W1-A's isz_log.c (process-
      * wide statics, since isz_set_log_callback predates the server
      * handle). These fields mirror them per-server for inspection and
@@ -325,6 +358,30 @@ int  isz_server_wrap_headless_output(isz_server *srv,
  * ISZ_EVENT_OUTPUT_REMOVE. The wrapper stays valid until the
  * Architect calls isz_output_destroy (SPEC §10). */
 void isz_server_unwrap_headless_output(isz_server *srv, uint32_t headless_id)
+    ISZ_INTERNAL;
+
+/* ------------------------------------------------------------------ */
+/* isz_listen + client accept / recv path (isz_listen.c)              */
+/* ------------------------------------------------------------------ */
+/* isz_accept_connection is called from isz_dispatch when the listen fd
+ * reports EPOLLIN. It accepts one client, runs the §6.2 handshake on
+ * a blocking socket, runs the §6.3 allowlist check via SO_PEERCRED,
+ * switches the client fd to non-blocking, wraps it in an isz_conn, and
+ * adds it to the server's epoll set with the client tag. */
+void isz_accept_connection(isz_server *srv) ISZ_INTERNAL;
+
+/* isz_recv_client_messages is called from isz_dispatch when a client
+ * fd reports EPOLLIN. It drains at least one framed message and routes
+ * each to isz_handle_client_message. On EOF or hard error it runs the
+ * §6.12 cleanup and emits CLIENT_DISCONNECT. */
+void isz_recv_client_messages(isz_server *srv, struct isz_client *c)
+    ISZ_INTERNAL;
+
+/* Wave 3 stub: real per-message dispatch lands in a future wave. Logs
+ * unknown messages at debug level. */
+void isz_handle_client_message(isz_server *srv, struct isz_conn *conn,
+                               uint32_t msg_id,
+                               const void *payload, size_t payload_len)
     ISZ_INTERNAL;
 
 #endif /* ISZ_SERVER_INTERNAL_H */

@@ -113,9 +113,13 @@ ISZ_API int isz_commit(isz_output *out, uint32_t flags)
     if (isz_backend_state(be) == ISZ_BACKEND_COMMITTING)
         return ISZ_ERR_COMMIT_PENDING;
 
-    /* SPEC 10: commits to a removed output are rejected. W2-A does not
-     * yet mark removed outputs; skip until the lifecycle wave adds a
-     * disconnected flag or accessor. */
+    /* SPEC §10 / §7.10: a removed-output commit returns
+     * ISZ_ERR_OUTPUT_DISCONNECTED. The output-remove hook sets
+     * disconnected=true; the wrapper stays valid until the Architect
+     * calls isz_output_destroy, but commits are rejected in the
+     * meantime. */
+    if (out->disconnected)
+        return ISZ_ERR_OUTPUT_DISCONNECTED;
 
     /* Gather surfaces bound to this output. */
     isz_surface **surfs = NULL;

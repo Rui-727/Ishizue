@@ -245,12 +245,19 @@ static void isz_headless_dump(const struct isz_backend *self, FILE *fp)
     }
 }
 
+/* Headless owns no real CRTCs, so blanking is a no-op. */
+static void isz_headless_blank_all_crtcs(struct isz_backend *self)
+{
+    (void)self;
+}
+
 static const struct isz_backend_ops isz_headless_ops = {
-    .init        = isz_headless_init,
-    .commit      = isz_headless_commit,
-    .read_events = isz_headless_read_events,
-    .destroy     = isz_headless_destroy,
-    .dump        = isz_headless_dump,
+    .init            = isz_headless_init,
+    .commit          = isz_headless_commit,
+    .read_events     = isz_headless_read_events,
+    .destroy         = isz_headless_destroy,
+    .dump            = isz_headless_dump,
+    .blank_all_crtcs = isz_headless_blank_all_crtcs,
 };
 
 const struct isz_backend_ops *isz_headless_get_ops(void)

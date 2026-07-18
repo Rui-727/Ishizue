@@ -24,26 +24,32 @@
 /* isz_lifecycle.c - public server lifecycle (SPEC §5, §7.6, §10, §12).
  *
  * isz_init: allocate the server, create the backend (dispatches by type
- * via isz_backend_create), create the default seat, set up the epoll
- * set, and register the headless output hook if the backend is
- * headless. Returns NULL on failure with an isz_log_internal error.
+ * via isz_backend_create), create the default seat, spin up the thread
+ * pool (W2-C), arm the PSI monitor and add its fd to the epoll set,
+ * register the headless output hook if the backend is headless, and
+ * leave the epoll set ready for isz_listen to add the listen fd. Returns
+ * NULL on failure with an isz_log_internal error.
  *
  * isz_dispatch: one non-blocking iteration. Drains the epoll set (1
- * iteration, timeout 0), calls the backend's read_events, and drains
- * libinput + libseat session events. Subsystems emit events straight
- * to listeners via isz_server_emit_event; dispatch itself does not
- * walk the listener registry.
+ * iteration, timeout 0) and routes each ready fd by tag: listen fd →
+ * isz_accept_connection (W3-A), client fd → isz_recv_client_messages
+ * (W3-A), PSI fd → isz_psi_dispatch, backend fd → isz_backend_read_events.
+ * libinput + libseat are drained unconditionally (they're no-ops until
+ * the DRM wave wires their fds in). Subsystems emit events straight to
+ * listeners via isz_server_emit_event; dispatch itself does not walk the
+ * listener registry.
  *
  * isz_get_fds: returns the pollable fds the Architect should add to
  * their own epoll set: backend fds (currently none for headless), the
- * libinput fd, the PSI fd, and (once the client wave lands) client
- * sockets. Wave 2-A returns the PSI fd and libinput fd if either is
- * active; everything else is wired as the corresponding waves land.
+ * libinput fd, the PSI fd, and client sockets. The listen fd is owned
+ * by the library's epoll set after isz_listen; the Architect doesn't
+ * need to poll it themselves.
  *
  * isz_destroy (SPEC §7.6): mark DESTROYING, disconnect clients
- * (isz_conn_close + emit CLIENT_DISCONNECT), destroy outputs, destroy
- * the default seat / input state, destroy the backend, close epoll,
- * free.
+ * (isz_conn_close + emit CLIENT_DISCONNECT), close the listen fd,
+ * destroy outputs, destroy the default seat / input state, drain the
+ * thread pool (blocking until queued work finishes, per W2-C), destroy
+ * the backend, close epoll, free.
  *
  * The cross-wave accessors isz_server_get_input_state /
  * isz_server_set_input_state / isz_server_emit_event /
@@ -53,6 +59,7 @@
 
 #include "isz_server_internal.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -123,6 +130,7 @@ ISZ_API isz_server *isz_init(enum isz_backend_type backend, void *backend_config
     srv->state         = ISZ_SERVER_UNINITIALIZED;
     srv->backend_type  = backend;
     srv->epoll_fd      = -1;
+    srv->listen_fd     = -1;
     srv->next_output_id = 1;
     srv->log_level     = ISZ_LOG_WARN;
 
@@ -177,6 +185,37 @@ ISZ_API isz_server *isz_init(enum isz_backend_type backend, void *backend_config
         goto fail_backend;
     }
 
+    /* Thread pool (W2-C). NULL on failure or when ENABLE_THREAD_POOL=0;
+     * isz_thread_pool_submit returns -1 in that case. The pool is
+     * optional, so failure to allocate is non-fatal; we log and move
+     * on with srv->thread_pool == NULL. */
+    srv->thread_pool = isz_thread_pool_create(ISZ_THREAD_POOL_SIZE);
+    if (!srv->thread_pool)
+        isz_log_internal(ISZ_LOG_INFO,
+                         "isz_init: thread pool unavailable (ENABLE_THREAD_POOL=0 or alloc failure)");
+
+    /* PSI monitor: if init armed the fd, add it to the epoll set so
+     * isz_dispatch can drain trigger events. When PSI is unavailable
+     * (kernel < 4.20 or CONFIG_PSI=n) the fd stays -1 and we skip the
+     * epoll_ctl. */
+    int psi_fd = isz_psi_get_fd(&srv->psi);
+    if (psi_fd >= 0) {
+        srv->psi_tag.kind   = ISZ_FD_PSI;
+        srv->psi_tag.opaque = NULL;
+        struct epoll_event pev;
+        pev.events   = EPOLLIN;
+        pev.data.ptr = &srv->psi_tag;
+        if (epoll_ctl(srv->epoll_fd, EPOLL_CTL_ADD, psi_fd, &pev) < 0) {
+            isz_log_internal(ISZ_LOG_WARN,
+                             "isz_init: epoll_ctl ADD psi failed: %s",
+                             strerror(errno));
+        }
+    }
+
+    /* Backend fds: the headless backend owns no fds. The DRM backend
+     * wave adds the DRM fd + vblank fds here and tags them
+     * ISZ_FD_BACKEND so dispatch routes them to isz_backend_read_events. */
+
     srv->state = ISZ_SERVER_RUNNING;
     isz_log_internal(ISZ_LOG_INFO, "isz_init: backend=%d state=RUNNING",
                      (int)backend);
@@ -202,37 +241,56 @@ ISZ_API void isz_dispatch(isz_server *srv)
     if (!srv || srv->state != ISZ_SERVER_RUNNING)
         return;
 
-    /* Drain our epoll set, one non-blocking tick. Wave 2-A has nothing
-     * in the set (no client sockets yet, headless has no fds); this
-     * loop is here for the waves that follow. */
+    /* Drain our epoll set, one non-blocking tick. Each ready fd carries
+     * a struct isz_fd_tag * in epoll_data.ptr; route by tag->kind. */
     if (srv->epoll_fd >= 0) {
         struct epoll_event evs[16];
         int n = epoll_wait(srv->epoll_fd, evs, 16, 0);
+        for (int i = 0; i < n; i++) {
+            struct isz_fd_tag *tag = evs[i].data.ptr;
+            if (!tag)
+                continue;
+            switch (tag->kind) {
+            case ISZ_FD_LISTEN:
+                isz_accept_connection(srv);
+                break;
+            case ISZ_FD_CLIENT:
+                isz_recv_client_messages(srv, tag->opaque);
+                break;
+            case ISZ_FD_PSI:
+                /* §8: drain the kernel PSI record so the trigger
+                 * rearms. SPEC §9 has no memory-pressure event, so
+                 * we don't emit; the Architect reads /proc/meminfo
+                 * or polls the PSI fd themselves if they want detail. */
+                isz_psi_dispatch(&srv->psi);
+                isz_log_internal(ISZ_LOG_DEBUG,
+                                 "psz: pressure trigger fired");
+                break;
+            case ISZ_FD_BACKEND:
+                /* Backend fds (DRM page-flip, etc.): hand off to
+                 * the backend's read_events. */
+                if (srv->backend) {
+                    int rc = isz_backend_read_events(srv->backend);
+                    if (rc < 0 && rc != ISZ_ERR_FEATURE_UNAVAIL)
+                        isz_log_internal(ISZ_LOG_WARN,
+                                         "isz_dispatch: backend read_events rc=%d", rc);
+                }
+                break;
+            }
+        }
         if (n < 0) {
             /* EINTR is normal under debugger signals; log others. */
             isz_log_internal(ISZ_LOG_DEBUG,
                              "isz_dispatch: epoll_wait rc=%d", n);
         }
-        /* Per-fd dispatch is implemented by the client and surface
-         * waves; they register the fd → callback mapping. */
-    }
-
-    if (srv->backend) {
-        int rc = isz_backend_read_events(srv->backend);
-        if (rc < 0 && rc != ISZ_ERR_FEATURE_UNAVAIL)
-            isz_log_internal(ISZ_LOG_WARN,
-                             "isz_dispatch: backend read_events rc=%d", rc);
     }
 
     /* §9: libinput_next_event runs directly in the main dispatch loop.
-     * §9 session: libseat_dispatch drains inline. */
+     * §9 session: libseat_dispatch drains inline. No-ops until the DRM
+     * wave wires libinput/libseat fds; the headless backend has no
+     * input devices. */
     isz_session_dispatch(srv);
     isz_input_dispatch(srv);
-
-    /* PSI: if the monitor is armed and readable, consume the event so
-     * the trigger rearms. The Architect decides what to do with the
-     * pressure signal (SPEC §8: eviction policy is theirs). */
-    isz_psi_dispatch(&srv->psi);
 }
 
 /* ------------------------------------------------------------------ */
@@ -292,9 +350,16 @@ ISZ_API void isz_destroy(isz_server *srv)
      * in-flight listener callbacks can see we're tearing down. */
     srv->state = ISZ_SERVER_DESTROYING;
 
+    /* Close the listen fd (§6.1). epoll_ctl DEL is implicit on close
+     * in Linux; we don't bother calling it explicitly. */
+    if (srv->listen_fd >= 0) {
+        close(srv->listen_fd);
+        srv->listen_fd = -1;
+    }
+
     /* Disconnect clients (SPEC §6.12). The full cleanup (surfaces,
-     * buffers, plane slots) is the surface wave's job; Wave 2-A
-     * closes the conn and emits CLIENT_DISCONNECT. */
+     * buffers, plane slots) is the surface wave's job; W3-A closes the
+     * conn and emits CLIENT_DISCONNECT. */
     isz_list_node *pos;
     while ((pos = isz_list_pop_front(&srv->clients)) != NULL) {
         struct isz_client *c = container_of(pos, struct isz_client, node);

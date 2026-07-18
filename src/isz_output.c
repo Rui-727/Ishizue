@@ -266,7 +266,9 @@ void isz_server_unwrap_headless_output(isz_server *srv, uint32_t headless_id)
         if (o->is_headless && o->headless_id == headless_id) {
             /* SPEC §10: surface ISZ_EVENT_OUTPUT_REMOVE. The wrapper
              * stays valid until the Architect calls isz_output_destroy;
-             * mark it as removed so commits are rejected. */
+             * mark it as removed so isz_commit rejects further commits
+             * with ISZ_ERR_OUTPUT_DISCONNECTED (§7.10). */
+            o->disconnected = true;
             isz_event ev;
             memset(&ev, 0, sizeof(ev));
             ev.type = ISZ_EVENT_OUTPUT_REMOVE;

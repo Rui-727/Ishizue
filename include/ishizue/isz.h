@@ -98,6 +98,11 @@ void        isz_dispatch(isz_server *srv) ISZ_API;
 int         isz_get_fds(isz_server *srv, int *fds, size_t max) ISZ_API;
 void        isz_destroy(isz_server *srv) ISZ_API;
 
+/* §6.1: attach a listening Unix domain socket. The Architect creates and
+ * binds the socket, calls listen(2), then hands the fd to the library.
+ * The library owns accept/handshake/allowlist/dispatch from here on. */
+int isz_listen(isz_server *srv, int listen_fd) ISZ_API;
+
 /* ------------------------------------------------------------------ */
 /* Client allowlist - §6.3                                            */
 /* ------------------------------------------------------------------ */

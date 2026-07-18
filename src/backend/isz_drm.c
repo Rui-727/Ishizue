@@ -66,12 +66,23 @@ static void isz_drm_dump(const struct isz_backend *self, FILE *fp)
     fprintf(fp, "  drm: stub (not yet implemented)\n");
 }
 
+/* SPEC section 12: blank every CRTC. Async-signal-safe (called from
+ * the crash handler). The real DRM path (drmModeSetCrtc with no FB per
+ * CRTC) lands with the DRM backend wave; this stub is a no-op so the
+ * handler never touches an unresolved symbol on the only functional
+ * backend. */
+static void isz_drm_blank_all_crtcs(struct isz_backend *self)
+{
+    (void)self;
+}
+
 static const struct isz_backend_ops isz_drm_ops = {
-    .init        = isz_drm_init,
-    .commit      = isz_drm_commit,
-    .read_events = isz_drm_read_events,
-    .destroy     = isz_drm_destroy,
-    .dump        = isz_drm_dump,
+    .init            = isz_drm_init,
+    .commit          = isz_drm_commit,
+    .read_events     = isz_drm_read_events,
+    .destroy         = isz_drm_destroy,
+    .dump            = isz_drm_dump,
+    .blank_all_crtcs = isz_drm_blank_all_crtcs,
 };
 
 const struct isz_backend_ops *isz_drm_get_ops(void)
