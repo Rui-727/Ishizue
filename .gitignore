@@ -15,3 +15,7 @@ libishizue.so.*
 # OS
 .DS_Store
 Thumbs.db
+
+# x11bridge build artifacts
+x11bridge/build/
+x11bridge/x11bridge
