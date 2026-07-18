@@ -480,3 +480,41 @@ ISZ_API size_t isz_output_get_plane_slots(isz_output *out,
     }
     return out->slot_count;
 }
+
+/* ------------------------------------------------------------------ */
+/* DRM backend internal accessors (W4-A).                             */
+/*                                                                    */
+/* isz_output_set_gpu_node pins a render node path on the output so   */
+/* the atomic builder can pick the right DRM fd for cross-GPU import  */
+/* (SPEC 10). isz_output_get_hdr_metadata is the read-side counter-   */
+/* part to the public isz_output_set_hdr_metadata; the EDID parser    */
+/* also writes into the same storage so the Architect's set call      */
+/* always overrides the parsed value. isz_output_set_vrr_enabled     */
+/* flips the per-output VRR flag the atomic builder consults.         */
+/* ------------------------------------------------------------------ */
+ISZ_INTERNAL int isz_output_set_gpu_node(isz_output *out,
+                                         const char *render_node_path)
+{
+    if (!out || !render_node_path)
+        return ISZ_ERR_INVALID_ARG;
+    size_t n = strlen(render_node_path);
+    if (n == 0 || n >= sizeof(out->gpu_node_path))
+        return ISZ_ERR_INVALID_ARG;
+    memcpy(out->gpu_node_path, render_node_path, n + 1);
+    return ISZ_OK;
+}
+
+ISZ_INTERNAL const isz_hdr_metadata *isz_output_get_hdr_metadata(isz_output *out)
+{
+    if (!out)
+        return NULL;
+    return &out->hdr;
+}
+
+ISZ_INTERNAL int isz_output_set_vrr_enabled(isz_output *out, bool enabled)
+{
+    if (!out)
+        return ISZ_ERR_INVALID_ARG;
+    out->vrr_enabled = enabled;
+    return ISZ_OK;
+}

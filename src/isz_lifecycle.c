@@ -70,6 +70,9 @@
 #include "util/isz_thread_pool.h"
 #include "backend/isz_backend.h"
 #include "backend/isz_headless.h"
+#ifdef ISHIZUE_HAVE_DRM
+#include "backend/isz_drm.h"
+#endif
 #include "buffer/isz_buffer.h"
 #include "buffer/isz_psi.h"
 #include "input/isz_seat_internal.h"
@@ -177,6 +180,17 @@ ISZ_API isz_server *isz_init(enum isz_backend_type backend, void *backend_config
         }
     }
 
+#ifdef ISHIZUE_HAVE_DRM
+    /* DRM backend: wire the backend's server back-channel so it adds its
+     * DRM fd to srv->epoll_fd with the backend tag (W3-A handoff). The
+     * real wiring happens inside isz_drm_set_server; the dispatch loop's
+     * ISZ_FD_BACKEND handler already routes ready events to
+     * isz_backend_read_events. */
+    if (backend == ISZ_BACKEND_DRM) {
+        isz_drm_set_server(srv->backend, srv);
+    }
+#endif
+
     /* Create the default seat (W1-E). For the DRM backend, libseat +
      * libinput are wired by the DRM wave; for headless, the seat
      * exists but has no devices. */
@@ -184,6 +198,19 @@ ISZ_API isz_server *isz_init(enum isz_backend_type backend, void *backend_config
         isz_log_internal(ISZ_LOG_ERROR, "isz_init: default seat creation failed");
         goto fail_backend;
     }
+
+#ifdef ISHIZUE_HAVE_DRM
+    /* SPEC 3: on SESSION_INACTIVE the DRM backend drops master; on
+     * SESSION_ACTIVE it re-acquires and surfaces ISZ_ERR_DRM_MASTER
+     * via isz_backend_set_error if re-acquisition fails. The listener
+     * registry is initialized above, so registering here is safe. */
+    if (backend == ISZ_BACKEND_DRM) {
+        isz_add_listener(srv, ISZ_EVENT_SESSION_ACTIVE,
+                         isz_drm_session_active_listener, srv->backend);
+        isz_add_listener(srv, ISZ_EVENT_SESSION_INACTIVE,
+                         isz_drm_session_inactive_listener, srv->backend);
+    }
+#endif
 
     /* Thread pool (W2-C). NULL on failure or when ENABLE_THREAD_POOL=0;
      * isz_thread_pool_submit returns -1 in that case. The pool is
@@ -303,9 +330,24 @@ ISZ_API int isz_get_fds(isz_server *srv, int *fds, size_t max)
 
     size_t n = 0;
 
-    /* Backend fds. The DRM backend exposes a DRM fd + vblank fds in a
-     * later wave; headless has none. */
-    /* TODO: srv->backend->ops->get_fds when the DRM wave lands. */
+    /* Backend fds. Headless has none. The DRM backend's DRM fd lives
+     * in srv->epoll_fd with the backend tag; isz_get_fds still returns
+     * it for Architects who prefer to poll it in their own epoll set. */
+#ifdef ISHIZUE_HAVE_DRM
+    if (srv->backend && srv->backend_type == ISZ_BACKEND_DRM) {
+        int bcount = isz_drm_get_fds(srv->backend, NULL, 0);
+        if (bcount > 0) {
+            int bfds[8];
+            int got = isz_drm_get_fds(srv->backend, bfds,
+                                      (size_t)bcount < 8u ? (size_t)bcount : 8u);
+            for (int i = 0; i < got; i++) {
+                if (n < max)
+                    fds[n] = bfds[i];
+                n++;
+            }
+        }
+    }
+#endif
 
     /* libinput fd (§9). */
     if (srv->input_state && srv->input_state->fd >= 0) {

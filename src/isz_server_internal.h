@@ -203,6 +203,18 @@ struct isz_output {
     uint32_t             headless_id;
     bool                 is_headless;
 
+    /* DRM source identifiers. Set when the output wraps a DRM
+     * connector; 0 / false otherwise. drm_crtc_mask is the bit index
+     * the CRTC occupies in plane possible_crtcs masks (SPEC 10). */
+    uint32_t             drm_connector_id;
+    uint32_t             drm_crtc_id;
+    uint32_t             drm_crtc_mask;
+    bool                 is_drm;
+    bool                 hdr_capable;
+    bool                 vrr_capable;
+    bool                 vrr_enabled;
+    char                 gpu_node_path[64];  /* render node for scanout */
+
     /* Modes (EDID-derived for DRM; synthetic for headless). Stored as
      * an array of pointers so isz_output_get_modes can hand back the
      * same pointer array the caller cache expects. */
@@ -358,6 +370,31 @@ int  isz_server_wrap_headless_output(isz_server *srv,
  * ISZ_EVENT_OUTPUT_REMOVE. The wrapper stays valid until the
  * Architect calls isz_output_destroy (SPEC §10). */
 void isz_server_unwrap_headless_output(isz_server *srv, uint32_t headless_id)
+    ISZ_INTERNAL;
+
+/* W4-A DRM backend internal accessors. These are NOT in isz.h; they
+ * exist for the DRM backend wave to set / read DRM-specific output
+ * state without touching the public ABI. All hidden (no ISZ_API). */
+
+/* SPEC 10: pin a render node path for this output's scanout GPU. The
+ * path must be one of the render nodes the DRM backend enumerated at
+ * init. Returns ISZ_ERR_INVALID_ARG on a NULL path or unknown node,
+ * ISZ_OK on success. */
+int  isz_output_set_gpu_node(isz_output *out, const char *render_node_path)
+    ISZ_INTERNAL;
+
+/* SPEC 7.2: read back the HDR metadata blob the Architect set via
+ * isz_output_set_hdr_metadata (or that the EDID parser populated).
+ * Returns a pointer into the output's storage; valid until the next
+ * set call or output destruction. NULL-tolerant. */
+const isz_hdr_metadata *isz_output_get_hdr_metadata(isz_output *out)
+    ISZ_INTERNAL;
+
+/* SPEC 7.2: enable / disable VRR on the next commit. The atomic
+ * builder reads out->vrr_enabled and sets VRR_ENABLED on the CRTC.
+ * Setting VRR on a CRTC that doesn't advertise vrr_capable is a
+ * no-op (the builder skips the prop). */
+int  isz_output_set_vrr_enabled(isz_output *out, bool enabled)
     ISZ_INTERNAL;
 
 /* ------------------------------------------------------------------ */

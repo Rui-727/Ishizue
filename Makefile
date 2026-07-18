@@ -39,7 +39,29 @@ PKG_DEPS = libdrm libinput libseat xkbcommon
 PKG_CFLAGS  := $(shell pkg-config --cflags $(PKG_DEPS) 2>/dev/null)
 PKG_LIBS    := $(shell pkg-config --libs   $(PKG_DEPS) 2>/dev/null)
 
-override CFLAGS  += -Iinclude $(PKG_CFLAGS)
+# Auto-detect each optional dependency and define ISHIZUE_HAVE_<name>
+# when pkg-config finds it. The feature is gated behind the macro in
+# the source; without it, the relevant code path is a stub.
+HAVE_LIBDRM     := $(shell pkg-config --exists libdrm     && echo 1)
+HAVE_LIBINPUT   := $(shell pkg-config --exists libinput   && echo 1)
+HAVE_LIBSEAT    := $(shell pkg-config --exists libseat    && echo 1)
+HAVE_XKBCOMMON  := $(shell pkg-config --exists xkbcommon  && echo 1)
+
+PKG_HAVE_FLAGS :=
+ifneq ($(HAVE_LIBDRM),)
+PKG_HAVE_FLAGS += -DISHIZUE_HAVE_DRM=1
+endif
+ifneq ($(HAVE_LIBINPUT),)
+PKG_HAVE_FLAGS += -DISHIZUE_HAVE_LIBINPUT=1
+endif
+ifneq ($(HAVE_LIBSEAT),)
+PKG_HAVE_FLAGS += -DISHIZUE_HAVE_LIBSEAT=1
+endif
+ifneq ($(HAVE_XKBCOMMON),)
+PKG_HAVE_FLAGS += -DISHIZUE_HAVE_XKBCOMMON=1
+endif
+
+override CFLAGS  += -Iinclude $(PKG_CFLAGS) $(PKG_HAVE_FLAGS)
 override LDFLAGS += $(PKG_LIBS)
 
 SRC_DIRS = src src/backend src/protocol src/render src/input src/buffer src/util
@@ -94,6 +116,7 @@ test check:
 	        -DENABLE_THREAD_POOL=$(ENABLE_THREAD_POOL) \
 	        -DENABLE_HEADLESS=$(ENABLE_HEADLESS) \
 	        -DISHIZUE_ENABLE_TEST_HOOKS \
+	        $(PKG_HAVE_FLAGS) \
 	        -Iinclude $$(pkg-config --cflags libdrm libinput libseat xkbcommon 2>/dev/null) \
 	        -c "$$f" -o "$$obj" || exit 1; \
 	done

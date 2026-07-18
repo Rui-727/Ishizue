@@ -48,6 +48,10 @@
 #include "isz_server_internal.h"
 #include "util/isz_compiler.h"
 
+#ifdef ISHIZUE_HAVE_DRM
+#include "backend/isz_drm.h"
+#endif
+
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -133,10 +137,16 @@ ISZ_API int isz_enable_crash_recovery(isz_server *srv)
      * server (it might be in any state when the signal fires), so we
      * cache what we need up front. */
     g_crash_state.backend    = srv->backend;
-    /* VT fd: -1 for headless. The DRM wave will expose the libseat
-     * session's VT fd via an accessor; until then VT restore is a
-     * no-op, which is correct for the headless backend. */
+    /* VT fd: -1 for headless. The DRM backend exposes the libseat
+     * session's VT fd via isz_drm_get_vt_fd when ISHIZUE_HAVE_DRM is
+     * defined and a real session is active. Without libdrm or without
+     * libseat, VT restore is a no-op, which is correct for the
+     * headless backend. */
     g_crash_state.vt_fd      = -1;
+#ifdef ISHIZUE_HAVE_DRM
+    if (srv->backend && srv->backend->type == ISZ_BACKEND_DRM)
+        g_crash_state.vt_fd = isz_drm_get_vt_fd(srv->backend);
+#endif
     g_crash_state.in_handler = 0;
 
     srv->crash_recovery_enabled = true;
