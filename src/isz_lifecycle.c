@@ -382,46 +382,14 @@ ISZ_API void isz_destroy(isz_server *srv)
     free(srv);
 }
 
-/* ------------------------------------------------------------------ */
-/* isz_enable_crash_recovery (SPEC §12)                               */
-/* ------------------------------------------------------------------ */
-/* Opt-in. The full implementation installs a SIGSEGV/SIGABRT handler
- * that restores the VT and blanks all CRTCs before re-raising the
- * signal. That requires the DRM backend (for CRTC blanking) and
- * libseat (for VT restore); neither is built in Wave 2-A. We set the
- * flag and return ISZ_OK so the Architect's call doesn't fail; the
- * signal handler installation lands with the DRM wave. */
-ISZ_API int isz_enable_crash_recovery(isz_server *srv)
-{
-    if (!srv)
-        return ISZ_ERR_INVALID_ARG;
-    srv->crash_recovery_enabled = true;
-    isz_log_internal(ISZ_LOG_INFO,
-                     "crash recovery requested (handler install deferred)");
-    return ISZ_OK;
-}
-
-/* ------------------------------------------------------------------ */
-/* Test hooks (SPEC §4, ISHIZUE_ENABLE_TEST_HOOKS only)               */
-/* ------------------------------------------------------------------ */
-/* isz_test_simulate_output_hotplug drives the headless backend's
- * hotplug path. The backend's helper fires the output hook we
- * registered in isz_init, which wraps the new output into an
- * isz_output and emits ISZ_EVENT_OUTPUT_ADD. */
-#ifdef ISHIZUE_ENABLE_TEST_HOOKS
-ISZ_API void isz_test_simulate_output_hotplug(isz_server *srv,
-                                              uint32_t width, uint32_t height)
-{
-    if (!srv || !srv->backend)
-        return;
-    if (srv->backend_type != ISZ_BACKEND_HEADLESS) {
-        isz_log_internal(ISZ_LOG_WARN,
-                         "test_simulate_output_hotplug: not headless backend");
-        return;
-    }
-    int rc = isz_headless_simulate_output_hotplug(srv->backend, width, height);
-    if (rc < 0)
-        isz_log_internal(ISZ_LOG_WARN,
-                         "test_simulate_output_hotplug: backend rc=%d", rc);
-}
-#endif
+/* isz_enable_crash_recovery (SPEC section 12) is implemented in
+ * src/isz_crash_recovery.c (W2-D). That file installs the SIGSEGV /
+ * SIGABRT / SIGBUS handler that restores the VT, blanks all CRTCs, and
+ * re-raises the signal so an Architect-installed crash reporter still
+ * runs. The stub that used to live here has been removed to avoid a
+ * duplicate symbol.
+ *
+ * The test hooks (SPEC section 4) are implemented in
+ * src/isz_test_hooks.c (W2-D), guarded by ISHIZUE_ENABLE_TEST_HOOKS.
+ * The isz_test_simulate_output_hotplug stub that used to live here has
+ * been removed for the same reason. */
