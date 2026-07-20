@@ -69,6 +69,8 @@ typedef struct isz_event         isz_event;
 typedef struct isz_hdr_metadata  isz_hdr_metadata;
 typedef struct isz_rect          isz_rect;
 typedef struct isz_plane_slot_info isz_plane_slot_info;
+typedef struct isz_text_input    isz_text_input;
+typedef struct isz_input_method  isz_input_method;
 
 /* ------------------------------------------------------------------ */
 /* Backend selection - §10                                            */
@@ -150,6 +152,10 @@ size_t isz_output_get_plane_slots(isz_output *out,
 isz_surface *isz_surface_create(isz_server *srv) ISZ_API;
 void         isz_surface_destroy(isz_surface *surf) ISZ_API;
 
+/* SPEC §6.4 surface serial: 64-bit, monotonic, global to the server
+ * lifetime, never reused. Returns 0 only for a NULL surface. */
+uint64_t     isz_surface_get_serial(isz_surface *surf) ISZ_API;
+
 int isz_surface_attach_buffer(isz_surface *surf, int dmabuf_fd,
                               isz_buffer_desc *desc) ISZ_API;
 int isz_surface_detach_buffer(isz_surface *surf) ISZ_API;
@@ -178,6 +184,37 @@ enum isz_transform {
     ISZ_TRANSFORM_REFLECT_Y = 5,
 };
 int isz_surface_set_transform(isz_surface *surf, enum isz_transform t) ISZ_API;
+
+/* SPEC §7.2 fractional scale: stored (numerator, denominator). The
+ * library forwards the preferred scale to the owning client via a
+ * ISZ_MSG_SURFACE_PREFERRED_SCALE event so the client renders at the
+ * right resolution. The library does not composite or rescale.
+ * denominator == 0 is rejected as ISZ_ERR_INVALID_ARG. */
+int isz_surface_set_scale(isz_surface *surf, uint32_t numerator,
+                           uint32_t denominator) ISZ_API;
+
+/* SPEC §6.15 idle inhibit: per-surface flag. When the count of
+ * inhibited surfaces on a given output transitions between zero and
+ * non-zero, the library emits ISZ_EVENT_IDLE_INHIBIT_ACTIVE /
+ * ISZ_EVENT_IDLE_INHIBIT_INACTIVE for that output. The library does
+ * not touch any idle timer, screensaver, or DPMS state. */
+int isz_surface_set_idle_inhibit(isz_surface *surf, bool inhibit) ISZ_API;
+
+/* SPEC §6.17 surface roles: an optional role attached at creation
+ * time. role_handle is the X11 window XID for the X11 roles and 0 for
+ * NORMAL. Setting an X11 role is gated by the §6.3 allowlist on the
+ * wire side; the library does not enforce that here. */
+enum isz_surface_role {
+    ISZ_SURFACE_ROLE_NORMAL      = 0,
+    ISZ_SURFACE_ROLE_X11_TOPLEVEL = 1,
+    ISZ_SURFACE_ROLE_X11_POPUP   = 2,
+    ISZ_SURFACE_ROLE_LAYER       = 3,
+};
+int                   isz_surface_set_role(isz_surface *surf,
+                                            enum isz_surface_role role,
+                                            uint64_t role_handle) ISZ_API;
+enum isz_surface_role isz_surface_get_role(isz_surface *surf) ISZ_API;
+uint64_t              isz_surface_get_role_handle(isz_surface *surf) ISZ_API;
 
 /* Subsurfaces - §6.6 */
 isz_surface *isz_surface_create_subsurface(isz_surface *parent) ISZ_API;
@@ -252,6 +289,52 @@ int isz_seat_device_set_accel_profile(isz_seat_device *dev,
 int isz_seat_device_set_calibration(isz_seat_device *dev,
                                      const float matrix[9]) ISZ_API;
 
+/* SPEC §6.8 selections: two slots per seat, PRIMARY (mouse-select)
+ * and CLIPBOARD (Ctrl-C). Each ownership change carries a
+ * CLOCK_MONOTONIC_RAW timestamp in nanoseconds; the library uses it
+ * to break ties when claims arrive in quick succession, latest wins.
+ * Stale claims (timestamp older than the current owner's) are
+ * rejected with ISZ_ERR_INVALID_ARG. */
+enum isz_selection_slot {
+    ISZ_SELECTION_PRIMARY   = 0,
+    ISZ_SELECTION_CLIPBOARD = 1,
+};
+int          isz_seat_set_selection_owner(isz_seat *seat,
+                                           enum isz_selection_slot slot,
+                                           isz_surface *owner,
+                                           uint64_t timestamp_ns) ISZ_API;
+isz_surface *isz_seat_get_selection_owner(isz_seat *seat,
+                                           enum isz_selection_slot slot) ISZ_API;
+
+/* SPEC §6.16 text input and input methods. Per-seat text-input object
+ * on the client side and per-seat input-method object on the IME side.
+ * v1 stores the state on the text-input struct; real IME routing is
+ * post-v1. */
+isz_text_input *isz_seat_create_text_input(isz_seat *seat) ISZ_API;
+isz_input_method *isz_seat_create_input_method(isz_seat *seat) ISZ_API;
+
+int  isz_text_input_set_surrounding_text(isz_text_input *ti,
+                                          const char *text,
+                                          uint32_t cursor,
+                                          uint32_t anchor) ISZ_API;
+int  isz_text_input_set_content_type(isz_text_input *ti,
+                                      uint32_t hint,
+                                      uint32_t purpose) ISZ_API;
+int  isz_text_input_set_cursor_rectangle(isz_text_input *ti,
+                                          int32_t x, int32_t y,
+                                          int32_t w, int32_t h) ISZ_API;
+int  isz_text_input_enable(isz_text_input *ti) ISZ_API;
+int  isz_text_input_disable(isz_text_input *ti) ISZ_API;
+int  isz_text_input_commit_string(isz_text_input *ti,
+                                   const char *text) ISZ_API;
+int  isz_text_input_preedit_string(isz_text_input *ti,
+                                    const char *text,
+                                    int32_t cursor_begin,
+                                    int32_t cursor_end) ISZ_API;
+void isz_text_input_destroy(isz_text_input *ti) ISZ_API;
+
+void isz_input_method_destroy(isz_input_method *im) ISZ_API;
+
 /* ------------------------------------------------------------------ */
 /* Commit - §7.3                                                      */
 /* ------------------------------------------------------------------ */
@@ -292,6 +375,11 @@ enum isz_event_type {
     ISZ_EVENT_CLIENT_DISCONNECT    = 17,
     ISZ_EVENT_INPUT_KEYBOARD_FOCUS_CHANGED = 18,
     ISZ_EVENT_CLIPBOARD_REQUEST    = 19,
+    ISZ_EVENT_IDLE_INHIBIT_ACTIVE   = 20,  /* §6.15 */
+    ISZ_EVENT_IDLE_INHIBIT_INACTIVE = 21,  /* §6.15 */
+    ISZ_EVENT_TEXT_INPUT_PREEDIT    = 22,  /* §6.16 */
+    ISZ_EVENT_TEXT_INPUT_COMMIT     = 23,  /* §6.16 */
+    ISZ_EVENT_TEXT_INPUT_CURSOR_RECTANGLE_NEEDED = 24,  /* §6.16 */
 };
 
 /* Event accessors - §5, §9. Allow reading isz_event fields without
@@ -344,6 +432,23 @@ const char *isz_event_get_client_binary_path(const isz_event *ev) ISZ_API; /* NU
 
 /* ISZ_EVENT_CLIPBOARD_REQUEST */
 const char *isz_event_get_clipboard_mime_type(const isz_event *ev) ISZ_API;
+uint64_t    isz_event_get_clipboard_timestamp(const isz_event *ev) ISZ_API;
+
+/* ISZ_EVENT_IDLE_INHIBIT_ACTIVE / INACTIVE */
+isz_output *isz_event_get_idle_inhibit_output(const isz_event *ev) ISZ_API;
+
+/* ISZ_EVENT_TEXT_INPUT_PREEDIT */
+const char *isz_event_get_text_input_preedit(const isz_event *ev,
+                                              int32_t *cursor_begin_out,
+                                              int32_t *cursor_end_out) ISZ_API;
+/* ISZ_EVENT_TEXT_INPUT_COMMIT */
+const char *isz_event_get_text_input_commit(const isz_event *ev) ISZ_API;
+/* ISZ_EVENT_TEXT_INPUT_CURSOR_RECTANGLE_NEEDED */
+int isz_event_get_text_input_cursor_rectangle(const isz_event *ev,
+                                                int32_t *x_out,
+                                                int32_t *y_out,
+                                                int32_t *w_out,
+                                                int32_t *h_out) ISZ_API;
 
 typedef void (*isz_event_listener_fn)(void *userdata, const isz_event *ev);
 
@@ -351,6 +456,21 @@ int isz_add_listener(isz_server *srv, enum isz_event_type type,
                      isz_event_listener_fn fn, void *userdata) ISZ_API;
 int isz_remove_listener(isz_server *srv, enum isz_event_type type,
                         isz_event_listener_fn fn) ISZ_API;
+
+/* ------------------------------------------------------------------ */
+/* Portal consent (SPEC §6.11)                                         */
+/* ------------------------------------------------------------------ */
+/* General per-(output, kind) user-grant mechanism with a 60s timeout.
+ * Replaces the older isz_capture_grant / isz_capture_check_consent
+ * pair, which remain as thin wrappers for screen capture so existing
+ * callers (x11bridge, tests) keep building. */
+enum isz_consent_kind {
+    ISZ_CONSENT_SCREEN_CAPTURE = 0,
+    ISZ_CONSENT_FILE_ACCESS    = 1,
+    ISZ_CONSENT_NOTIFICATION   = 2,
+};
+int  isz_consent_grant(isz_server *srv, isz_output *out,
+                        enum isz_consent_kind kind) ISZ_API;
 
 /* ------------------------------------------------------------------ */
 /* Screen capture - §7.11                                             */

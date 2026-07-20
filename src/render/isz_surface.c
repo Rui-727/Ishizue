@@ -60,6 +60,10 @@ static void surface_init_nodes(struct isz_surface *s)
     isz_list_init(&s->children);
 }
 
+/* Forward: the §6.15 idle-inhibit helper is defined below the
+ * lifecycle section but called from isz_surface_destroy. */
+static void isz_surface_inhibit_adjust(isz_output *out, int delta);
+
 ISZ_API isz_surface *isz_surface_create(isz_server *srv)
 {
     if (!srv) return NULL;
@@ -72,6 +76,12 @@ ISZ_API isz_surface *isz_surface_create(isz_server *srv)
     s->transform = ISZ_TRANSFORM_NORMAL;
     s->owning_conn = NULL;
     s->object_id = 0;
+    /* §6.4: assign a 64-bit monotonic serial, global to the server
+     * lifetime, never reused. First surface gets serial 1; 0 is
+     * reserved for "no surface" on the read side. */
+    s->serial = ++srv->next_surface_serial;
+    s->role = ISZ_SURFACE_ROLE_NORMAL;
+    s->role_handle = 0;
     surface_init_nodes(s);
 
     ensure_list_inited();
@@ -83,6 +93,12 @@ ISZ_API isz_surface *isz_surface_create(isz_server *srv)
 ISZ_API void isz_surface_destroy(isz_surface *surf)
 {
     if (!surf) return;
+
+    /* §6.15: if this surface was inhibiting idle on its output, drop
+     * the contribution before tearing down. The helper emits
+     * ISZ_EVENT_IDLE_INHIBIT_INACTIVE on the 1->0 transition. */
+    if (surf->idle_inhibit)
+        isz_surface_inhibit_adjust(surf->output, -1);
 
     isz_list_remove(&surf->server_node);
     if (surf->kind == ISZ_SURFACE_SUBSURFACE)
@@ -103,6 +119,17 @@ ISZ_API void isz_surface_destroy(isz_surface *surf)
     free(surf->damage);
     /* Children are independent surfaces; not freed here. */
     free(surf);
+}
+
+/* ------------------------------------------------------------------ */
+/* §6.4 surface serial                                                */
+/* ------------------------------------------------------------------ */
+
+ISZ_API uint64_t isz_surface_get_serial(isz_surface *surf)
+{
+    if (!surf)
+        return 0;
+    return surf->serial;
 }
 
 /* ------------------------------------------------------------------ */
@@ -189,12 +216,52 @@ ISZ_API int isz_surface_damage(isz_surface *surf, isz_rect *rects,
 }
 
 /* ------------------------------------------------------------------ */
+/* §6.15 idle inhibit helper                                          */
+/* ------------------------------------------------------------------ */
+
+/* Adjust out->idle_inhibit_count by delta (+1 / -1) and emit the
+ * matching ISZ_EVENT_IDLE_INHIBIT_ACTIVE / _INACTIVE event on a
+ * 0 <-> non-zero transition. NULL-tolerant so callers can pass
+ * surf->output without checking it first. Single-threaded per SPEC 5,
+ * so the count and the emit are unsynchronized. */
+static void isz_surface_inhibit_adjust(isz_output *out, int delta)
+{
+    if (!out || delta == 0)
+        return;
+    int before = out->idle_inhibit_count;
+    int after = before + delta;
+    out->idle_inhibit_count = after;
+
+    isz_event ev;
+    memset(&ev, 0, sizeof(ev));
+    if (before == 0 && after > 0) {
+        ev.type = ISZ_EVENT_IDLE_INHIBIT_ACTIVE;
+        ev.u.idle_inhibit.output = out;
+        ev.u.idle_inhibit.active = true;
+        isz_server_emit_event(out->srv, &ev);
+    } else if (before > 0 && after == 0) {
+        ev.type = ISZ_EVENT_IDLE_INHIBIT_INACTIVE;
+        ev.u.idle_inhibit.output = out;
+        ev.u.idle_inhibit.active = false;
+        isz_server_emit_event(out->srv, &ev);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Setters                                                            */
 /* ------------------------------------------------------------------ */
 
 ISZ_API int isz_surface_set_output(isz_surface *surf, isz_output *out)
 {
     if (!surf || !out) return ISZ_ERR_INVALID_ARG;
+    /* §6.15: if this surface is inhibiting idle, relocate the
+     * contribution from the old output to the new one. The helpers
+     * emit INACTIVE on the old output's 1->0 transition and ACTIVE on
+     * the new output's 0->1 transition. */
+    if (surf->idle_inhibit && surf->output != out) {
+        isz_surface_inhibit_adjust(surf->output, -1);
+        isz_surface_inhibit_adjust(out, +1);
+    }
     surf->output = out;
     return ISZ_OK;
 }
@@ -204,6 +271,10 @@ ISZ_API int isz_surface_clear_output(isz_surface *surf)
     if (!surf) return ISZ_ERR_INVALID_ARG;
     if (surf->plane_slot_set && surf->output)
         isz_plane_slot_release(surf->output, surf->plane_slot, surf);
+    /* §6.15: drop this surface's idle-inhibit contribution from the
+     * old output. The helper emits INACTIVE on the 1->0 transition. */
+    if (surf->idle_inhibit)
+        isz_surface_inhibit_adjust(surf->output, -1);
     surf->output = NULL;
     return ISZ_OK;
 }
@@ -315,4 +386,63 @@ ISZ_API isz_surface *isz_surface_create_layer(isz_output *out,
     s->layer = layer;
     s->output = out;
     return s;
+}
+
+/* ------------------------------------------------------------------ */
+/* W8-B additions (SPEC §6.15, §6.17, §7.2)                          */
+/* ------------------------------------------------------------------ */
+
+ISZ_API int isz_surface_set_idle_inhibit(isz_surface *surf, bool inhibit)
+{
+    if (!surf) return ISZ_ERR_INVALID_ARG;
+    if (surf->idle_inhibit == inhibit)
+        return ISZ_OK;
+    /* §6.15: adjust the owning output's count and emit on transition.
+     * The helper is NULL-tolerant, so a surface with no output set
+     * just stores the flag; the count gets adjusted later when the
+     * surface is assigned an output via isz_surface_set_output. */
+    if (inhibit)
+        isz_surface_inhibit_adjust(surf->output, +1);
+    else
+        isz_surface_inhibit_adjust(surf->output, -1);
+    surf->idle_inhibit = inhibit;
+    return ISZ_OK;
+}
+
+ISZ_API int isz_surface_set_scale(isz_surface *surf, uint32_t numerator,
+                                   uint32_t denominator)
+{
+    if (!surf) return ISZ_ERR_INVALID_ARG;
+    if (denominator == 0) return ISZ_ERR_INVALID_ARG;
+    surf->scale_numerator = numerator;
+    surf->scale_denominator = denominator;
+    /* The wire-side ISZ_MSG_SURFACE_PREFERRED_SCALE send happens from
+     * the client dispatch wave when the surface has an owning
+     * connection. v1 stores the values; the read side exposes them
+     * via the surface struct. */
+    return ISZ_OK;
+}
+
+ISZ_API int isz_surface_set_role(isz_surface *surf,
+                                  enum isz_surface_role role,
+                                  uint64_t role_handle)
+{
+    if (!surf) return ISZ_ERR_INVALID_ARG;
+    if (role < ISZ_SURFACE_ROLE_NORMAL || role > ISZ_SURFACE_ROLE_LAYER)
+        return ISZ_ERR_INVALID_ARG;
+    surf->role = role;
+    surf->role_handle = role_handle;
+    return ISZ_OK;
+}
+
+ISZ_API enum isz_surface_role isz_surface_get_role(isz_surface *surf)
+{
+    if (!surf) return ISZ_SURFACE_ROLE_NORMAL;
+    return surf->role;
+}
+
+ISZ_API uint64_t isz_surface_get_role_handle(isz_surface *surf)
+{
+    if (!surf) return 0;
+    return surf->role_handle;
 }

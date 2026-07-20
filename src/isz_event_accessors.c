@@ -209,5 +209,62 @@ ISZ_API const char *isz_event_get_clipboard_mime_type(const isz_event *ev)
      * return NULL so callers can branch safely. */
     if (!ev || ev->type != ISZ_EVENT_CLIPBOARD_REQUEST)
         return NULL;
-    return NULL;
+    return ev->u.clipboard_request.mime_type;
+}
+
+ISZ_API uint64_t isz_event_get_clipboard_timestamp(const isz_event *ev)
+{
+    /* §6.8 selection-ownership timestamp. 0 when no emit site has
+     * populated the field yet, or when ev is the wrong type. */
+    if (!ev || ev->type != ISZ_EVENT_CLIPBOARD_REQUEST)
+        return 0;
+    return ev->u.clipboard_request.timestamp_ns;
+}
+
+ISZ_API isz_output *isz_event_get_idle_inhibit_output(const isz_event *ev)
+{
+    /* §6.15: ACTIVE / INACTIVE carry the output whose inhibit count
+     * transitioned. NULL on wrong type or NULL ev. */
+    if (!ev || (ev->type != ISZ_EVENT_IDLE_INHIBIT_ACTIVE &&
+                ev->type != ISZ_EVENT_IDLE_INHIBIT_INACTIVE))
+        return NULL;
+    return ev->u.idle_inhibit.output;
+}
+
+ISZ_API const char *isz_event_get_text_input_preedit(const isz_event *ev,
+                                                      int32_t *cursor_begin_out,
+                                                      int32_t *cursor_end_out)
+{
+    /* §6.16: preedit text from the active input method. text is
+     * borrowed and valid for the listener callback. */
+    if (!ev || ev->type != ISZ_EVENT_TEXT_INPUT_PREEDIT)
+        return NULL;
+    isz_set_i32(cursor_begin_out, ev->u.text_input_preedit.cursor_begin);
+    isz_set_i32(cursor_end_out,   ev->u.text_input_preedit.cursor_end);
+    return ev->u.text_input_preedit.text;
+}
+
+ISZ_API const char *isz_event_get_text_input_commit(const isz_event *ev)
+{
+    /* §6.16: committed text from the active input method. */
+    if (!ev || ev->type != ISZ_EVENT_TEXT_INPUT_COMMIT)
+        return NULL;
+    return ev->u.text_input_commit.text;
+}
+
+ISZ_API int isz_event_get_text_input_cursor_rectangle(const isz_event *ev,
+                                                        int32_t *x_out,
+                                                        int32_t *y_out,
+                                                        int32_t *w_out,
+                                                        int32_t *h_out)
+{
+    /* §6.16: cursor rectangle for the focused text-input, forwarded
+     * back to the IME on _CURSOR_RECTANGLE_NEEDED. */
+    if (!ev || ev->type != ISZ_EVENT_TEXT_INPUT_CURSOR_RECTANGLE_NEEDED)
+        return ISZ_ERR_INVALID_ARG;
+    isz_set_i32(x_out, ev->u.text_input_cursor_rectangle.x);
+    isz_set_i32(y_out, ev->u.text_input_cursor_rectangle.y);
+    isz_set_i32(w_out, ev->u.text_input_cursor_rectangle.w);
+    isz_set_i32(h_out, ev->u.text_input_cursor_rectangle.h);
+    return ISZ_OK;
 }

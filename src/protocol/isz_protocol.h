@@ -142,6 +142,36 @@ enum isz_msg_id {
 
     /* Generic fatal error notification (S2C), followed by disconnect. */
     ISZ_MSG_ERROR = 50,
+
+    /* W8-B protocol additions (SPEC §6.4, §6.8, §6.15, §6.16, §7.2). */
+
+    /* S2C: preferred fractional scale for a surface (§7.2).
+     * Payload: u32 surface_id + u32 numerator + u32 denominator. */
+    ISZ_MSG_SURFACE_PREFERRED_SCALE = 51,
+
+    /* C2S: claim selection ownership for a (slot, timestamp) pair
+     * (§6.8). Replaces the older CLIPBOARD_SET message for the
+     * ownership-transfer step; the data-fd still travels via
+     * SCM_RIGHTS as in §6.8. Payload: u32 slot + u64 timestamp_ns. */
+    ISZ_MSG_SET_SELECTION_OWNER = 52,
+
+    /* S2C: preedit text from the active input method (§6.16).
+     * Payload: u32 text-input id + i32 cursor_begin + i32 cursor_end
+     * + UTF-8 text bytes (no NUL terminator; length derived from
+     * payload_len). */
+    ISZ_MSG_TEXT_INPUT_PREEDIT = 53,
+
+    /* S2C: committed text from the active input method (§6.16).
+     * Payload: u32 text-input id + UTF-8 text bytes. */
+    ISZ_MSG_TEXT_INPUT_COMMIT = 54,
+
+    /* S2C: an output entered the idle-inhibit-active state (§6.15).
+     * Payload: u32 output_id. */
+    ISZ_MSG_IDLE_INHIBIT_ACTIVE = 55,
+
+    /* S2C: an output returned to the idle-inhibit-inactive state
+     * (§6.15). Payload: u32 output_id. */
+    ISZ_MSG_IDLE_INHIBIT_INACTIVE = 56,
 };
 
 /* ------------------------------------------------------------------ */

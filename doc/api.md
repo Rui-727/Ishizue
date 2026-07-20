@@ -907,3 +907,190 @@ Asks the headless backend to create a new virtual output. The
 output hook fires, the server wraps the new output, and
 `ISZ_EVENT_OUTPUT_ADD` is emitted synchronously. No-op for non-
 headless backends.
+
+## Surface serials (SPEC §6.4)
+
+### `uint64_t isz_surface_get_serial(isz_surface *surf)`
+
+Returns the 64-bit monotonic serial assigned at surface creation.
+Serials are global to the server lifetime and never reused; the
+first surface gets serial 1, 0 is reserved for "no surface" on the
+read side. Used for cross-subsystem pairing (e.g. the X11 bridge
+attaches an X11 window XID via serial lookup rather than per-
+connection ID).
+
+Return: the serial, or 0 for a NULL surface.
+
+## Selections (SPEC §6.8)
+
+### `int isz_seat_set_selection_owner(isz_seat *seat, enum isz_selection_slot slot, isz_surface *owner, uint64_t timestamp_ns)`
+
+Sets or clears the owner of the PRIMARY (`ISZ_SELECTION_PRIMARY`) or
+CLIPBOARD (`ISZ_SELECTION_CLIPBOARD`) selection slot. The two slots
+are independent: PRIMARY mirrors the X11 mouse-select / middle-click
+convention, CLIPBOARD mirrors Ctrl-C / Ctrl-V. Each slot has its own
+owner and timestamp.
+
+`timestamp_ns` is a `CLOCK_MONOTONIC_RAW` nanosecond count. A new
+claim whose timestamp is older than the current owner's is rejected
+as stale; a release (`owner == NULL`) is always accepted and clears
+the stored timestamp.
+
+Return: `ISZ_OK`, `ISZ_ERR_INVALID_ARG` (NULL seat, bad slot, or
+stale claim).
+
+### `isz_surface *isz_seat_get_selection_owner(isz_seat *seat, enum isz_selection_slot slot)`
+
+Returns the current owner of the slot, or NULL when unowned or on a
+bad argument.
+
+## Idle inhibit (SPEC §6.15)
+
+### `int isz_surface_set_idle_inhibit(isz_surface *surf, bool inhibit)`
+
+Sets or clears the per-surface idle-inhibit flag. The library
+maintains a per-output count of inhibited surfaces; on the 0 to
+non-zero transition it emits `ISZ_EVENT_IDLE_INHIBIT_ACTIVE` for
+that output, on the 1 to 0 transition it emits
+`ISZ_EVENT_IDLE_INHIBIT_INACTIVE`. The library does not touch any
+idle timer, screensaver, or DPMS state.
+
+If the surface has no output assigned when the flag is set, the
+count adjustment is deferred to the next `isz_surface_set_output`
+call. Destroying an inhibited surface, clearing its output, or
+moving it to another output all relocate the contribution correctly.
+
+Return: `ISZ_OK` or `ISZ_ERR_INVALID_ARG` (NULL surf).
+
+## Text input and input methods (SPEC §6.16)
+
+Per-seat text-input object on the client side, per-seat input-
+method object on the IME side. v1 stores the client-supplied state
+on the text-input struct; real IME routing is post-v1.
+
+### `isz_text_input *isz_seat_create_text_input(isz_seat *seat)`
+
+Allocates a text-input object linked to the seat. The seat owns the
+list and tears it down on `isz_destroy`.
+
+Return: a text-input handle, or NULL on NULL seat or allocation
+failure.
+
+### `isz_input_method *isz_seat_create_input_method(isz_seat *seat)`
+
+Allocates an input-method stub for the seat. v1 keeps one IME per
+seat; a second create call frees the first.
+
+Return: an input-method handle, or NULL on NULL seat or allocation
+failure.
+
+### `int isz_text_input_set_surrounding_text(isz_text_input *ti, const char *text, uint32_t cursor, uint32_t anchor)`
+
+Records the surrounding text and cursor / anchor offsets. `text`
+may be NULL to clear. The library copies the string.
+
+### `int isz_text_input_set_content_type(isz_text_input *ti, uint32_t hint, uint32_t purpose)`
+
+Records the content-type hint and purpose for the focused field.
+Both are pass-through; the library does not interpret them.
+
+### `int isz_text_input_set_cursor_rectangle(isz_text_input *ti, int32_t x, int32_t y, int32_t w, int32_t h)`
+
+Records the cursor rectangle in surface-local coordinates. Forwarded
+to the IME on `ISZ_EVENT_TEXT_INPUT_CURSOR_RECTANGLE_NEEDED`.
+
+### `int isz_text_input_enable(isz_text_input *ti)` / `int isz_text_input_disable(isz_text_input *ti)`
+
+Flips the text-input's enabled flag. Real IME wiring is post-v1.
+
+### `int isz_text_input_commit_string(isz_text_input *ti, const char *text)` / `int isz_text_input_preedit_string(isz_text_input *ti, const char *text, int32_t cursor_begin, int32_t cursor_end)`
+
+v1 stubs: the library emits the matching
+`ISZ_EVENT_TEXT_INPUT_COMMIT` / `_PREEDIT` only when an input-method
+drives the commit. The client-side entry points record the request
+for a future IME wave to read back.
+
+### `void isz_text_input_destroy(isz_text_input *ti)` / `void isz_input_method_destroy(isz_input_method *im)`
+
+Unlinks from the seat and frees the struct. NULL-tolerant.
+
+## Fractional scale (SPEC §7.2)
+
+### `int isz_surface_set_scale(isz_surface *surf, uint32_t numerator, uint32_t denominator)`
+
+Stores the fractional scale (e.g. `3, 2` for 1.5x). The library
+forwards the preferred scale to the owning client via an
+`ISZ_MSG_SURFACE_PREFERRED_SCALE` event so the client renders at the
+right resolution. The library itself does not composite or rescale.
+
+Return: `ISZ_OK` or `ISZ_ERR_INVALID_ARG` (NULL surf or
+`denominator == 0`).
+
+## Surface roles (SPEC §6.17)
+
+### `int isz_surface_set_role(isz_surface *surf, enum isz_surface_role role, uint64_t role_handle)`
+
+Attaches a role and opaque handle to the surface. `role_handle` is
+the X11 window XID for the X11 roles and 0 for NORMAL. Setting an
+X11 role on the wire side is gated by the §6.3 allowlist; the
+library does not enforce that here.
+
+`enum isz_surface_role` covers `ISZ_SURFACE_ROLE_NORMAL`,
+`_X11_TOPLEVEL`, `_X11_POPUP`, `_LAYER`.
+
+Return: `ISZ_OK` or `ISZ_ERR_INVALID_ARG` (NULL surf or bad role).
+
+### `enum isz_surface_role isz_surface_get_role(isz_surface *surf)` / `uint64_t isz_surface_get_role_handle(isz_surface *surf)`
+
+Read back the role and role handle. `isz_surface_get_role` returns
+`ISZ_SURFACE_ROLE_NORMAL` for a NULL surface; `isz_surface_get_role_handle`
+returns 0.
+
+## Portal consent (SPEC §6.11)
+
+### `int isz_consent_grant(isz_server *srv, isz_output *out, enum isz_consent_kind kind)`
+
+Grants consent for `(srv, out, kind)`, valid 60 seconds. `kind` is
+one of `ISZ_CONSENT_SCREEN_CAPTURE`, `_FILE_ACCESS`,
+`_NOTIFICATION`. The library checks the grant lazily at the
+feature's entry point; expired entries are reclaimed on the next
+check or grant.
+
+Replaces the older `isz_capture_grant` for new callers; that
+function remains as a thin wrapper around
+`isz_consent_grant(srv, out, ISZ_CONSENT_SCREEN_CAPTURE)`.
+
+Return: `ISZ_OK`, `ISZ_ERR_INVALID_ARG` (NULL srv / out, bad kind),
+or `ISZ_ERR_RESOURCE_LIMIT` (consent table full).
+
+## Event accessors for new events (SPEC §6.8, §6.15, §6.16)
+
+### `uint64_t isz_event_get_clipboard_timestamp(const isz_event *ev)`
+
+For `ISZ_EVENT_CLIPBOARD_REQUEST`. Returns the
+`CLOCK_MONOTONIC_RAW` ownership timestamp of the current selection
+owner, so the Architect can reason about staleness. Returns 0 on a
+NULL event or wrong type.
+
+### `isz_output *isz_event_get_idle_inhibit_output(const isz_event *ev)`
+
+For `ISZ_EVENT_IDLE_INHIBIT_ACTIVE` / `_INACTIVE`. Returns the
+output whose inhibit count transitioned. NULL on a NULL event or
+wrong type.
+
+### `const char *isz_event_get_text_input_preedit(const isz_event *ev, int32_t *cursor_begin_out, int32_t *cursor_end_out)`
+
+For `ISZ_EVENT_TEXT_INPUT_PREEDIT`. Returns the preedit text
+(borrowed, valid for the listener callback) and writes the cursor
+range. NULL on a NULL event or wrong type.
+
+### `const char *isz_event_get_text_input_commit(const isz_event *ev)`
+
+For `ISZ_EVENT_TEXT_INPUT_COMMIT`. Returns the committed text
+(borrowed). NULL on a NULL event or wrong type.
+
+### `int isz_event_get_text_input_cursor_rectangle(const isz_event *ev, int32_t *x_out, int32_t *y_out, int32_t *w_out, int32_t *h_out)`
+
+For `ISZ_EVENT_TEXT_INPUT_CURSOR_RECTANGLE_NEEDED`. Reads the
+cursor rectangle. `ISZ_OK` on success, `ISZ_ERR_INVALID_ARG` on a
+NULL event or wrong type.

@@ -124,6 +124,52 @@ struct isz_event {
             isz_seat    *seat;
             isz_surface *surface;  /* NULL when focus cleared */
         } keyboard_focus;
+
+        /* §6.8 clipboard request: another client asked for the
+         * selection contents. mime_type is borrowed from the request
+         * payload and valid for the listener callback; timestamp_ns is
+         * the ownership timestamp of the current owner (latest-wins
+         * per §6.8). */
+        struct {
+            isz_seat    *seat;
+            const char  *mime_type;
+            uint64_t     timestamp_ns;
+            int          slot;  /* isz_selection_slot */
+        } clipboard_request;
+
+        /* §6.15 idle inhibit: the count of inhibited surfaces on the
+         * given output transitioned between zero and non-zero. */
+        struct {
+            isz_output *output;
+            bool        active;
+        } idle_inhibit;
+
+        /* §6.16 text input: preedit text from the active input method.
+         * text is borrowed and valid for the callback. */
+        struct {
+            isz_seat    *seat;
+            isz_text_input *text_input;
+            const char  *text;
+            int32_t      cursor_begin;
+            int32_t      cursor_end;
+        } text_input_preedit;
+
+        /* §6.16 text input: committed text from the active IME. */
+        struct {
+            isz_seat    *seat;
+            isz_text_input *text_input;
+            const char  *text;
+        } text_input_commit;
+
+        /* §6.16 text input: the IME requested the cursor rectangle
+         * for the focused text-input. The library forwards the
+         * focused surface's cursor rectangle back via the matching
+         * accessor. */
+        struct {
+            isz_seat    *seat;
+            isz_text_input *text_input;
+            int32_t      x, y, w, h;
+        } text_input_cursor_rectangle;
     } u;
 };
 
@@ -171,7 +217,7 @@ struct isz_seat {
     /* keyboard focus. §9: the library never reassigns focus itself. */
     isz_surface *keyboard_focus;
 
-    /* tracked pointer position, for absolute→delta conversion. */
+    /* tracked pointer position, for absolute->delta conversion. */
     double pointer_x, pointer_y;
 
     /* cursor surface config. Rendering is the render wave's job. */
@@ -186,7 +232,49 @@ struct isz_seat {
      * filtering stays the Architect's job. Unused in Wave 1. */
     void *listeners;
 
+    /* §6.8 selections: two slots per seat. selection_owner[slot] is
+     * the surface that currently owns the slot (NULL when unowned).
+     * selection_timestamp_ns[slot] is the CLOCK_MONOTONIC_RAW
+     * timestamp of the latest ownership claim; the library rejects
+     * stale claims (timestamp older than the stored one) per §6.8. */
+    isz_surface *selection_owner[2];
+    uint64_t     selection_timestamp_ns[2];
+
+    /* §6.16 text input / input method. v1 stores a singly-linked list
+     * of text-input objects per seat; the input-method side is a
+     * minimal stub. Real IME routing is post-v1. */
+    struct isz_text_input   *text_inputs_head;
+    struct isz_input_method *input_method;
+
     struct isz_seat *next, *prev;  /* input_state seat list */
+};
+
+/* ------------------------------------------------------------------ */
+/* Text input / input method (SPEC §6.16).                             */
+/*                                                                    */
+/* v1 stores the client-supplied state on the text-input struct; the  */
+/* IME side is a stub. enable / disable flip the enabled flag; the    */
+/* preedit / commit / cursor-rectangle accessors are exercised by     */
+/* future IME wiring. isz_text_input_destroy unlinks from the seat    */
+/* and frees the struct.                                              */
+/* ------------------------------------------------------------------ */
+struct isz_text_input {
+    struct isz_seat    *seat;
+    struct isz_text_input *next;
+
+    bool                enabled;
+    char               *surrounding_text;  /* malloc'd, may be NULL */
+    uint32_t            surrounding_cursor;
+    uint32_t            surrounding_anchor;
+    uint32_t            content_hint;
+    uint32_t            content_purpose;
+    int32_t             cursor_rect_x, cursor_rect_y;
+    int32_t             cursor_rect_w, cursor_rect_h;
+};
+
+struct isz_input_method {
+    struct isz_seat    *seat;
+    /* v1 stub: no state. Real IME wiring is post-v1. */
 };
 
 /* ------------------------------------------------------------------ */

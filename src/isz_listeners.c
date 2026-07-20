@@ -39,7 +39,7 @@
 
 #include "util/isz_log.h"
 
-/* Map an event_type to its bucket. Event types are 1..19 today; the
+/* Map an event_type to its bucket. Event types are 1..24 today; the
  * array has 32 slots. Anything out of range falls into bucket 0,
  * which is always empty (no event_type uses 0), so the emit becomes
  * a no-op rather than an out-of-bounds read. */

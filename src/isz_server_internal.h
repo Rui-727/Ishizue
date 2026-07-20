@@ -99,7 +99,7 @@ struct isz_fd_tag {
 /* Listener registry (SPEC §5)                                        */
 /* ------------------------------------------------------------------ */
 /* One intrusive list per event_type. Listeners fire in registration
- * order. Public isz_event_type values are 1..19; the array is sized
+ * order. Public isz_event_type values are 1..24; the array is sized
  * up to 32 for headroom without recompilation when new events land. */
 #define ISZ_LISTENER_BUCKETS 32
 
@@ -255,6 +255,12 @@ struct isz_output {
     isz_mode           **mode_ptr_cache;
     size_t               mode_ptr_count;
 
+    /* §6.15 idle inhibit: count of surfaces on this output with the
+     * idle-inhibit flag set. The library emits
+     * ISZ_EVENT_IDLE_INHIBIT_ACTIVE on the 0->1 transition and
+     * ISZ_EVENT_IDLE_INHIBIT_INACTIVE on the 1->0 transition. */
+    int                  idle_inhibit_count;
+
     isz_list_node        node;  /* server's outputs list */
 };
 
@@ -329,6 +335,11 @@ struct isz_server {
 
     /* Crash recovery (SPEC §12, opt-in). */
     bool                    crash_recovery_enabled;
+
+    /* §6.4 surface serial counter: 64-bit, monotonic, global to the
+     * server lifetime, never reused. First surface gets serial 1; 0
+     * is reserved for "no surface" on the read side. */
+    uint64_t                next_surface_serial;
 };
 
 /* ------------------------------------------------------------------ */

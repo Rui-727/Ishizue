@@ -106,6 +106,30 @@ struct isz_surface {
 
     /* Subsurfaces of this surface. */
     isz_list children;
+
+    /* ----------------------------------------------------------------
+     * W8-B additions (SPEC §6.4, §6.15, §6.17, §7.2). Appended at end
+     * so existing zero-initialized layouts stay source-compatible. */
+
+    /* §6.4 surface serial: 64-bit monotonic, global to the server,
+     * assigned at isz_surface_create. 0 only before assignment (which
+     * only happens for a NULL surface on the read side). */
+    uint64_t serial;
+
+    /* §6.15 idle inhibit: per-surface flag. The setter maintains the
+     * owning output's idle_inhibit_count and emits ACTIVE / INACTIVE
+     * on transitions. */
+    bool idle_inhibit;
+
+    /* §7.2 fractional scale: stored (numerator, denominator). 0/0
+     * means "not set"; the setter rejects denominator == 0. */
+    uint32_t scale_numerator;
+    uint32_t scale_denominator;
+
+    /* §6.17 surface roles: optional role + opaque handle (X11 XID for
+     * the X11 roles, 0 for NORMAL). Set once at surface creation. */
+    enum isz_surface_role role;
+    uint64_t              role_handle;
 };
 
 /* ------------------------------------------------------------------ */
@@ -145,15 +169,26 @@ const struct isz_output_plane_slot *
 isz_plane_slot_get(isz_output *out, int slot_id) ISZ_INTERNAL;
 
 /* ------------------------------------------------------------------ */
-/* Capture consent (SPEC 6.11, 7.11).                                 */
+/* Portal consent (SPEC §6.11, 7.11).                                  */
 /*                                                                    */
-/* Per-output, time-limited grant. The Architect calls grant() when   */
-/* the user approves; isz_output_capture_start calls check_consent()  */
-/* and fails with ISZ_ERR_ACCESS_DENIED if no valid grant exists.     */
-/* Implemented in src/isz_capture_consent.c (W2-D).                   */
+/* Per-(output, kind), time-limited grant. The Architect calls         */
+/* isz_consent_grant when the user approves; the capture / file /      */
+/* notification paths call isz_consent_check and fail with             */
+/* ISZ_ERR_ACCESS_DENIED if no valid grant exists. Implemented in      */
+/* src/isz_capture_consent.c.                                         */
+/*                                                                    */
+/* isz_capture_grant / isz_capture_check_consent remain as thin        */
+/* wrappers around the screen-capture kind so existing callers         */
+/* (x11bridge, tests) keep building.                                  */
 /* ------------------------------------------------------------------ */
+int  isz_consent_grant(isz_server *srv, isz_output *output,
+                        enum isz_consent_kind kind) ISZ_API;
+bool isz_consent_check(isz_server *srv, isz_output *output,
+                        enum isz_consent_kind kind) ISZ_INTERNAL;
+
 void isz_capture_grant(isz_server *srv, isz_output *output) ISZ_API;
-bool isz_capture_check_consent(isz_server *srv, isz_output *output) ISZ_INTERNAL;
+bool isz_capture_check_consent(isz_server *srv, isz_output *output)
+    ISZ_INTERNAL;
 
 /* ------------------------------------------------------------------ */
 /* Color management helpers (7.2). Used by the commit path to create  */
