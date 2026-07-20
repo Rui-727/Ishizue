@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../protocol/isz_wire_senders.h"
+
 /* §6.8 selection slot count. Kept as a macro so future slot additions
  * ripple through both the owner array and the timestamp array. */
 #define ISZ_SELECTION_SLOT_COUNT 2
@@ -386,11 +388,13 @@ ISZ_API int isz_text_input_commit_string(isz_text_input *ti,
 {
     if (!ti)
         return ISZ_ERR_INVALID_ARG;
-    /* v1 stub: store-and-forward is the IME's job. The library emits
-     * ISZ_EVENT_TEXT_INPUT_COMMIT only when an input-method drives the
-     * commit; this entry point records the client's own commit so a
-     * future IME wave can read it back. */
-    (void)text;
+    /* §6.16: forward the committed text to the client that owns this
+     * text-input. v1 has no wire message for text-input creation, so
+     * owning_conn is NULL for Architect-created text-inputs and the
+     * send is skipped. The IME-side store-and-forward stays the IME's
+     * job; the library only routes the bytes. */
+    if (ti->owning_conn && ti->object_id != 0)
+        isz_send_text_input_commit(ti->owning_conn, ti->object_id, text);
     return ISZ_OK;
 }
 
@@ -401,10 +405,12 @@ ISZ_API int isz_text_input_preedit_string(isz_text_input *ti,
 {
     if (!ti)
         return ISZ_ERR_INVALID_ARG;
-    /* v1 stub: see isz_text_input_commit_string. */
-    (void)text;
-    (void)cursor_begin;
-    (void)cursor_end;
+    /* §6.16: forward the preedit to the client that owns this
+     * text-input. See isz_text_input_commit_string for the
+     * owning_conn NULL case. */
+    if (ti->owning_conn && ti->object_id != 0)
+        isz_send_text_input_preedit(ti->owning_conn, ti->object_id,
+                                    text, cursor_begin, cursor_end);
     return ISZ_OK;
 }
 

@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "../util/isz_log.h"
+#include "../protocol/isz_wire_senders.h"
 
 /* ------------------------------------------------------------------ */
 /* Global surface list                                                */
@@ -239,11 +240,17 @@ static void isz_surface_inhibit_adjust(isz_output *out, int delta)
         ev.u.idle_inhibit.output = out;
         ev.u.idle_inhibit.active = true;
         isz_server_emit_event(out->srv, &ev);
+        /* §6.15: also notify each client that has a surface on this
+         * output via the wire protocol. The Architect-side listener
+         * above and the wire-side fan-out below are independent: the
+         * first drives policy, the second drives clients. */
+        isz_render_send_idle_inhibit(out, true);
     } else if (before > 0 && after == 0) {
         ev.type = ISZ_EVENT_IDLE_INHIBIT_INACTIVE;
         ev.u.idle_inhibit.output = out;
         ev.u.idle_inhibit.active = false;
         isz_server_emit_event(out->srv, &ev);
+        isz_render_send_idle_inhibit(out, false);
     }
 }
 
@@ -416,10 +423,14 @@ ISZ_API int isz_surface_set_scale(isz_surface *surf, uint32_t numerator,
     if (denominator == 0) return ISZ_ERR_INVALID_ARG;
     surf->scale_numerator = numerator;
     surf->scale_denominator = denominator;
-    /* The wire-side ISZ_MSG_SURFACE_PREFERRED_SCALE send happens from
-     * the client dispatch wave when the surface has an owning
-     * connection. v1 stores the values; the read side exposes them
-     * via the surface struct. */
+    /* §7.2: forward the preferred scale to the client that owns this
+     * surface so it can render at the right resolution. Architect-
+     * created surfaces (no owning_conn) skip the wire send; the
+     * stored values are still readable via the surface struct. */
+    if (surf->owning_conn && surf->object_id != 0)
+        isz_send_surface_preferred_scale(surf->owning_conn,
+                                         surf->object_id,
+                                         numerator, denominator);
     return ISZ_OK;
 }
 

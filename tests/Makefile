@@ -17,7 +17,7 @@ CC ?= cc
 # -DISHIZUE_ENABLE_TEST_HOOKS is mandatory: isz.h hides the test hook
 # declarations behind it.
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -g \
-          -DISHIZUE_ENABLE_TEST_HOOKS
+	  -DISHIZUE_ENABLE_TEST_HOOKS
 
 # Always-on include paths. The parent's CFLAGS carries -Iinclude,
 # which is relative to the parent dir and so misses in this sub-make.
@@ -36,7 +36,7 @@ endif
 # (already set by parent when present)
 RUN_LDFLAGS = $(LDFLAGS)
 
-TESTS = test_headless_basic test_client_protocol
+TESTS = test_headless_basic test_client_protocol test_protocol_additions
 
 .PHONY: all run clean
 all: $(TESTS)
@@ -48,6 +48,9 @@ test_headless_basic: test_headless_basic.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test_client_protocol: test_client_protocol.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+test_protocol_additions: test_protocol_additions.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # Run every test. Honor the LDFLAGS-derived library path if the parent

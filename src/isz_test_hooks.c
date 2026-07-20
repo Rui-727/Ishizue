@@ -52,9 +52,11 @@
 
 #include "isz_server_internal.h"
 #include "util/isz_compiler.h"
+#include "util/isz_list.h"
 #include "input/isz_seat_internal.h"
 #include "protocol/isz_conn.h"
 #include "backend/isz_headless.h"
+#include "render/isz_surface_internal.h"
 
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -198,6 +200,30 @@ ISZ_API void isz_test_simulate_output_hotplug(isz_server *srv,
      * hook; the server (W2-A) wraps that into an isz_output and emits
      * ISZ_EVENT_OUTPUT_ADD. */
     (void)isz_headless_simulate_output_hotplug(b, width, height);
+}
+
+/* W9-A: walk the global surface list and return the first surface
+ * with an owning conn (i.e. created by a client via the wire
+ * protocol). Used by test_protocol_additions to find the surface the
+ * child created, so the parent (Architect) can call
+ * isz_surface_set_scale / isz_surface_set_idle_inhibit on it and
+ * verify the resulting S2C wire messages arrive at the child.
+ *
+ * Not declared in isz.h (the public test-hook surface is frozen by
+ * W8-B); the test forward-declares it. Exported because the test
+ * binary links against the shared library. */
+ISZ_API isz_surface *isz_test_find_client_surface(isz_server *srv)
+{
+    (void)srv;
+    isz_list *surfaces = isz_render_surface_list();
+    isz_list_node *pos;
+    isz_list_for_each(pos, surfaces) {
+        isz_surface *s =
+            container_of(pos, isz_surface, server_node);
+        if (s->owning_conn)
+            return s;
+    }
+    return NULL;
 }
 
 #endif /* ISHIZUE_ENABLE_TEST_HOOKS */

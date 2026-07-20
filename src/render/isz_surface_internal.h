@@ -215,6 +215,13 @@ int isz_render_send_presented(isz_server *srv, isz_surface *surf,
 int isz_render_send_capture_done(isz_server *srv, isz_output *out,
                                  int dmabuf_fd, isz_buffer_desc *desc);
 
+/* W9-A: walk the surface list and send ISZ_MSG_IDLE_INHIBIT_ACTIVE
+ * (active=true) or _INACTIVE (active=false) to each unique owning
+ * conn that has a surface on out. Called from
+ * isz_surface_inhibit_adjust on a 0<->non-zero transition of
+ * out->idle_inhibit_count. NULL-tolerant on out. */
+void isz_render_send_idle_inhibit(isz_output *out, bool active);
+
 /* DRM backend wave provides this. Returns -1 for headless. */
 int isz_output_get_drm_fd(isz_output *out);
 

@@ -60,11 +60,13 @@
 #include <unistd.h>
 
 #include "util/isz_log.h"
+#include "util/isz_list.h"
 #include "backend/isz_backend.h"
 #include "buffer/isz_buffer.h"
 #include "input/isz_seat_internal.h"
 #include "protocol/isz_conn.h"
 #include "protocol/isz_protocol.h"
+#include "protocol/isz_wire_senders.h"
 #include "render/isz_surface_internal.h"
 
 /* ------------------------------------------------------------------ */
@@ -79,6 +81,11 @@
 #define ISZ_PRESENTED_LEN                12u  /* u32 surface_id + u64 vblank_ns */
 #define ISZ_RELEASE_LEN                  4u   /* u32 buffer_id */
 #define ISZ_CAPTURE_DONE_LEN             4u   /* u32 output_id (fd via cmsg) */
+#define ISZ_PREFERRED_SCALE_LEN          12u  /* u32 surface_id + u32 num + u32 den */
+#define ISZ_TEXT_INPUT_PREEDIT_HDR_LEN   12u  /* u32 id + i32 begin + i32 end */
+#define ISZ_TEXT_INPUT_COMMIT_HDR_LEN    4u   /* u32 id */
+#define ISZ_IDLE_INHIBIT_LEN             4u   /* u32 output_id */
+#define ISZ_SET_SELECTION_OWNER_LEN      20u  /* u32 slot + u64 ts + u32 surf + u32 fd_idx */
 
 /* ------------------------------------------------------------------ */
 /* Capture-state accessors (isz_capture.c)                            */
@@ -279,6 +286,157 @@ void isz_send_capture_done(struct isz_conn *conn, uint32_t output_id,
     }
     (void)isz_conn_send(conn, ISZ_MSG_CAPTURE_DONE,
                         payload, off, n_fds ? fds : NULL, n_fds);
+}
+
+/* ------------------------------------------------------------------ */
+/* W9-A: S2C senders for the five messages added by W8-B                */
+/* (§6.8, §6.15, §6.16, §7.2). Each is a thin encode + isz_conn_send.   */
+/* NULL-tolerant on conn so callers can pass surf->owning_conn without */
+/* a separate NULL check.                                               */
+/* ------------------------------------------------------------------ */
+
+/* SPEC §7.2: preferred fractional scale. The library forwards the
+ * (numerator, denominator) the Architect set on the surface to the
+ * client that owns it, so the client renders at the right resolution.
+ * The library does not composite or rescale. */
+void isz_send_surface_preferred_scale(struct isz_conn *conn,
+                                      uint32_t surface_id,
+                                      uint32_t numerator,
+                                      uint32_t denominator)
+{
+    if (!conn)
+        return;
+    uint8_t payload[ISZ_PREFERRED_SCALE_LEN];
+    size_t off = 0;
+    off = isz_proto_write_u32(payload, off, surface_id);
+    off = isz_proto_write_u32(payload, off, numerator);
+    off = isz_proto_write_u32(payload, off, denominator);
+    (void)isz_conn_send(conn, ISZ_MSG_SURFACE_PREFERRED_SCALE,
+                        payload, off, NULL, 0);
+}
+
+/* SPEC §6.16: preedit text. The payload carries the text-input id,
+ * cursor range, and UTF-8 bytes. text_len is derived from the byte
+ * count, not a NUL terminator. NULL text is treated as an empty
+ * string so the IME can clear preedit by passing NULL. */
+void isz_send_text_input_preedit(struct isz_conn *conn,
+                                 uint32_t text_input_id,
+                                 const char *text,
+                                 int32_t cursor_begin,
+                                 int32_t cursor_end)
+{
+    if (!conn)
+        return;
+    size_t text_len = text ? strlen(text) : 0;
+    if (text_len > ISZ_PROTO_MAX_MESSAGE - ISZ_MSG_HEADER_SIZE -
+                   ISZ_TEXT_INPUT_PREEDIT_HDR_LEN) {
+        text_len = ISZ_PROTO_MAX_MESSAGE - ISZ_MSG_HEADER_SIZE -
+                   ISZ_TEXT_INPUT_PREEDIT_HDR_LEN;
+    }
+    uint8_t payload[ISZ_PROTO_MAX_MESSAGE - ISZ_MSG_HEADER_SIZE];
+    size_t off = 0;
+    off = isz_proto_write_u32(payload, off, text_input_id);
+    off = isz_proto_write_i32(payload, off, cursor_begin);
+    off = isz_proto_write_i32(payload, off, cursor_end);
+    if (text_len > 0)
+        memcpy(payload + off, text, text_len);
+    off += text_len;
+    (void)isz_conn_send(conn, ISZ_MSG_TEXT_INPUT_PREEDIT,
+                        payload, off, NULL, 0);
+}
+
+/* SPEC §6.16: committed text. The payload carries the text-input id
+ * and UTF-8 bytes. NULL text is treated as an empty commit. */
+void isz_send_text_input_commit(struct isz_conn *conn,
+                                uint32_t text_input_id,
+                                const char *text)
+{
+    if (!conn)
+        return;
+    size_t text_len = text ? strlen(text) : 0;
+    if (text_len > ISZ_PROTO_MAX_MESSAGE - ISZ_MSG_HEADER_SIZE -
+                   ISZ_TEXT_INPUT_COMMIT_HDR_LEN) {
+        text_len = ISZ_PROTO_MAX_MESSAGE - ISZ_MSG_HEADER_SIZE -
+                   ISZ_TEXT_INPUT_COMMIT_HDR_LEN;
+    }
+    uint8_t payload[ISZ_PROTO_MAX_MESSAGE - ISZ_MSG_HEADER_SIZE];
+    size_t off = 0;
+    off = isz_proto_write_u32(payload, off, text_input_id);
+    if (text_len > 0)
+        memcpy(payload + off, text, text_len);
+    off += text_len;
+    (void)isz_conn_send(conn, ISZ_MSG_TEXT_INPUT_COMMIT,
+                        payload, off, NULL, 0);
+}
+
+/* SPEC §6.15: idle-inhibit-active. Sent when the count of inhibited
+ * surfaces on an output transitions from zero to non-zero. The
+ * payload is the output_id. */
+void isz_send_idle_inhibit_active(struct isz_conn *conn,
+                                  uint32_t output_id)
+{
+    if (!conn)
+        return;
+    uint8_t payload[ISZ_IDLE_INHIBIT_LEN];
+    size_t off = 0;
+    off = isz_proto_write_u32(payload, off, output_id);
+    (void)isz_conn_send(conn, ISZ_MSG_IDLE_INHIBIT_ACTIVE,
+                        payload, off, NULL, 0);
+}
+
+/* SPEC §6.15: idle-inhibit-inactive. Sent when the count of
+ * inhibited surfaces on an output returns to zero. */
+void isz_send_idle_inhibit_inactive(struct isz_conn *conn,
+                                    uint32_t output_id)
+{
+    if (!conn)
+        return;
+    uint8_t payload[ISZ_IDLE_INHIBIT_LEN];
+    size_t off = 0;
+    off = isz_proto_write_u32(payload, off, output_id);
+    (void)isz_conn_send(conn, ISZ_MSG_IDLE_INHIBIT_INACTIVE,
+                        payload, off, NULL, 0);
+}
+
+/* Walk the global surface list and send idle_inhibit_active or
+ * _inactive to each unique owning conn that has a surface on the
+ * given output. Called from isz_surface_inhibit_adjust (in
+ * isz_surface.c) on a 0<->non-zero transition of out's
+ * idle_inhibit_count.
+ *
+ * The dedup cap is small: a typical desktop has 1 to 3 clients with
+ * surfaces on a given output. A fixed 32-entry table covers that
+ * without an allocation; larger counts silently skip duplicates. */
+#define ISZ_INHIBIT_NOTIFY_MAX_CONNS 32
+void isz_render_send_idle_inhibit(isz_output *out, bool active)
+{
+    if (!out)
+        return;
+    isz_list *surfaces = isz_render_surface_list();
+    isz_list_node *pos;
+    struct isz_conn *seen[ISZ_INHIBIT_NOTIFY_MAX_CONNS];
+    size_t n_seen = 0;
+    isz_list_for_each(pos, surfaces) {
+        isz_surface *s =
+            container_of(pos, isz_surface, server_node);
+        if (s->output != out || !s->owning_conn)
+            continue;
+        bool dup = false;
+        for (size_t i = 0; i < n_seen; i++) {
+            if (seen[i] == s->owning_conn) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        if (n_seen < ISZ_INHIBIT_NOTIFY_MAX_CONNS)
+            seen[n_seen++] = s->owning_conn;
+        if (active)
+            isz_send_idle_inhibit_active(s->owning_conn, out->id);
+        else
+            isz_send_idle_inhibit_inactive(s->owning_conn, out->id);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1162,6 +1320,105 @@ static void isz_handle_clipboard_request(struct isz_conn *conn)
 }
 
 /* ------------------------------------------------------------------ */
+/* §6.8 selections (W9-A): SET_SELECTION_OWNER                         */
+/* ------------------------------------------------------------------ */
+/* The W8-B CLIPBOARD_SET path above is the older single-clipboard
+ * store-and-forward. SET_SELECTION_OWNER is the W8-B replacement that
+ * names a (slot, surface) pair, carries a CLOCK_MONOTONIC_RAW
+ * timestamp for stale-claim rejection, and optionally passes an fd
+ * with the selection contents.
+ *
+ * The library does not parse the fd per §6.8; it holds it for the
+ * next selection request. v1 stores one fd per slot in a process-
+ * global; a later wave that adds a selection-request wire message
+ * will hand the fd back via SCM_RIGHTS. The slot table is small
+ * (PRIMARY + CLIPBOARD), so a fixed array beats a hash. */
+#define ISZ_SELECTION_FD_NONE  0xFFFFFFFFu
+static int s_selection_fd[2] = { -1, -1 };
+
+static void isz_handle_set_selection_owner(isz_server *srv,
+                                           struct isz_conn *conn,
+                                           const uint8_t *payload,
+                                           size_t payload_len,
+                                           const int *fds, size_t n_fds)
+{
+    uint32_t slot = 0;
+    uint64_t timestamp_ns = 0;
+    uint32_t surface_id = 0;
+    uint32_t fd_index = ISZ_SELECTION_FD_NONE;
+    size_t off = 0;
+    if (!isz_proto_read_u32_checked(payload, &off, payload_len, &slot) ||
+        !isz_proto_read_u64_checked(payload, &off, payload_len,
+                                    &timestamp_ns) ||
+        !isz_proto_read_u32_checked(payload, &off, payload_len,
+                                    &surface_id) ||
+        !isz_proto_read_u32_checked(payload, &off, payload_len,
+                                    &fd_index)) {
+        isz_reply_error(conn, ISZ_MSG_SET_SELECTION_OWNER,
+                        ISZ_ERR_INVALID_ARG);
+        return;
+    }
+    if (slot > (uint32_t)ISZ_SELECTION_CLIPBOARD) {
+        isz_reply_error(conn, ISZ_MSG_SET_SELECTION_OWNER,
+                        ISZ_ERR_INVALID_ARG);
+        return;
+    }
+
+    /* owner_surface_id == 0 is the release form: clear ownership and
+     * drop any held fd for the slot. The library treats it the same
+     * as isz_seat_set_selection_owner(seat, slot, NULL, 0). */
+    isz_surface *owner = NULL;
+    if (surface_id != 0) {
+        owner = isz_conn_lookup_object(conn, surface_id,
+                                       ISZ_OBJECT_SURFACE);
+        if (!owner) {
+            isz_reply_error(conn, ISZ_MSG_SET_SELECTION_OWNER,
+                            ISZ_ERR_INVALID_ARG);
+            return;
+        }
+    }
+
+    isz_seat *seat = isz_seat_default(srv);
+    if (!seat) {
+        isz_reply_error(conn, ISZ_MSG_SET_SELECTION_OWNER,
+                        ISZ_ERR_NO_MEMORY);
+        return;
+    }
+    int rc = isz_seat_set_selection_owner(seat,
+                                          (enum isz_selection_slot)slot,
+                                          owner, timestamp_ns);
+    if (rc != ISZ_OK) {
+        isz_reply_error(conn, ISZ_MSG_SET_SELECTION_OWNER, rc);
+        return;
+    }
+
+    /* Hold the fd (if any) for the next selection request. The
+     * library dups the fd so isz_listen.c's close of the original
+     * does not invalidate the stored copy. A new fd for the same
+     * slot replaces the old one (closed). */
+    if (fd_index != ISZ_SELECTION_FD_NONE && fd_index < n_fds &&
+        fds[fd_index] >= 0) {
+        int stored = dup(fds[fd_index]);
+        isz_consume_fd(fds, n_fds, fd_index);
+        if (stored < 0) {
+            isz_reply_error(conn, ISZ_MSG_SET_SELECTION_OWNER,
+                            ISZ_ERR_NO_MEMORY);
+            return;
+        }
+        if (s_selection_fd[slot] >= 0)
+            close(s_selection_fd[slot]);
+        s_selection_fd[slot] = stored;
+    } else if (owner == NULL) {
+        /* Release form: drop any held fd. */
+        if (s_selection_fd[slot] >= 0) {
+            close(s_selection_fd[slot]);
+            s_selection_fd[slot] = -1;
+        }
+    }
+    /* Success is silent (no reply) per the W5-A pattern for setters. */
+}
+
+/* ------------------------------------------------------------------ */
 /* Drag-and-drop (SPEC §6.9): stub                                    */
 /* ------------------------------------------------------------------ */
 /* Pointer tracking that the drag state machine needs (motion → surface
@@ -1327,6 +1584,11 @@ int isz_handle_client_message(isz_server *srv, struct isz_conn *conn,
 
     case ISZ_MSG_CLIPBOARD_REQUEST:
         isz_handle_clipboard_request(conn);
+        break;
+
+    case ISZ_MSG_SET_SELECTION_OWNER:
+        isz_handle_set_selection_owner(srv, conn, payload, payload_len,
+                                       fds, n_fds);
         break;
 
     case ISZ_MSG_DRAG_START:

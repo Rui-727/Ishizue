@@ -152,7 +152,11 @@ enum isz_msg_id {
     /* C2S: claim selection ownership for a (slot, timestamp) pair
      * (§6.8). Replaces the older CLIPBOARD_SET message for the
      * ownership-transfer step; the data-fd still travels via
-     * SCM_RIGHTS as in §6.8. Payload: u32 slot + u64 timestamp_ns. */
+     * SCM_RIGHTS as in §6.8. Payload: u32 slot + u64 timestamp_ns
+     * + u32 owner_surface_id + u32 fd_index (0xFFFFFFFF when no fd
+     * accompanies the claim). The fd, when present, is held by the
+     * library for the next selection request; the library does not
+     * parse its contents per §6.8. */
     ISZ_MSG_SET_SELECTION_OWNER = 52,
 
     /* S2C: preedit text from the active input method (§6.16).

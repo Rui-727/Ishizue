@@ -51,6 +51,12 @@
 
 #define ISZ_SEAT_NAME_MAX 64
 
+/* Forward decl: struct isz_text_input carries an owning_conn pointer
+ * (W9-A) so the IME-side commit/preedit stubs can deliver wire
+ * messages to the right client. The full layout lives in
+ * src/protocol/isz_conn.h; this header does not include it. */
+struct isz_conn;
+
 /* ------------------------------------------------------------------ */
 /* Logging.                                                           */
 /*                                                                    */
@@ -270,6 +276,15 @@ struct isz_text_input {
     uint32_t            content_purpose;
     int32_t             cursor_rect_x, cursor_rect_y;
     int32_t             cursor_rect_w, cursor_rect_h;
+
+    /* W9-A: per-connection binding for wire-side preedit/commit
+     * delivery. Set by the dispatcher when a client creates a text-
+     * input via wire (future wave). NULL for Architect-created text-
+     * inputs; isz_text_input_commit_string /
+     * isz_text_input_preedit_string skip the wire send in that case.
+     * Forward-declared so this header does not pull in isz_conn.h. */
+    struct isz_conn *owning_conn;
+    uint32_t         object_id;
 };
 
 struct isz_input_method {
