@@ -149,6 +149,10 @@ test check:
 	@ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
 	    LD_LIBRARY_PATH=$$(pwd)/$(TEST_BUILD_DIR):$$LD_LIBRARY_PATH \
 	    ./x11bridge/tests/test_x11_opcodes
+	@echo "--- running test_x11_opcodes2 ---"
+	@ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+	    LD_LIBRARY_PATH=$$(pwd)/$(TEST_BUILD_DIR):$$LD_LIBRARY_PATH \
+	    ./x11bridge/tests/test_x11_opcodes2
 	@rm -rf $(TEST_BUILD_DIR)
 
 install: all

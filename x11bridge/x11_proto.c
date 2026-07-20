@@ -404,3 +404,273 @@ size_t x11_build_property_notify(uint8_t *out_buf,
     out_buf[16] = state;
     return 32;
 }
+
+/* GetWindowAttributes reply (44 bytes total). Reply length is 9
+ * (36 bytes after the first 8). */
+size_t x11_build_get_window_attributes_reply(uint8_t *out_buf,
+                                             uint8_t backing_store,
+                                             uint32_t visual,
+                                             uint16_t class_,
+                                             uint8_t bit_gravity,
+                                             uint8_t win_gravity,
+                                             uint32_t backing_planes,
+                                             uint32_t backing_pixel,
+                                             bool override_redirect,
+                                             bool save_under,
+                                             uint8_t map_state,
+                                             bool map_installed,
+                                             uint32_t colormap,
+                                             uint32_t all_event_masks,
+                                             uint32_t your_event_mask,
+                                             uint16_t do_not_propagate_mask,
+                                             uint16_t sequence,
+                                             uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 44);
+    out_buf[0] = 1u;  /* reply indicator */
+    out_buf[1] = backing_store;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, 9u, byte_order);  /* reply length */
+    x11_put_u32(out_buf + 8,  visual, byte_order);
+    x11_put_u16(out_buf + 12, class_, byte_order);
+    out_buf[14] = bit_gravity;
+    out_buf[15] = win_gravity;
+    x11_put_u32(out_buf + 16, backing_planes, byte_order);
+    x11_put_u32(out_buf + 20, backing_pixel, byte_order);
+    out_buf[24] = override_redirect ? 1u : 0u;
+    out_buf[25] = save_under ? 1u : 0u;
+    out_buf[26] = map_state;
+    out_buf[27] = map_installed ? 1u : 0u;
+    x11_put_u32(out_buf + 28, colormap, byte_order);
+    x11_put_u32(out_buf + 32, all_event_masks, byte_order);
+    x11_put_u32(out_buf + 36, your_event_mask, byte_order);
+    x11_put_u16(out_buf + 40, do_not_propagate_mask, byte_order);
+    /* bytes 42..43 pad */
+    return 44;
+}
+
+/* QueryTree reply (32 + 4*n bytes). Reply length is 6 + n. The
+ * children array is appended verbatim, each XID in the chosen byte
+ * order. */
+size_t x11_build_query_tree_reply(uint8_t *out_buf, size_t out_cap,
+                                  uint32_t root, uint32_t parent,
+                                  const uint32_t *children, uint16_t n,
+                                  uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    size_t total = 32u + (size_t)n * 4u;
+    if (out_cap < total) return 0;
+    memset(out_buf, 0, total);
+    out_buf[0] = 1u;  /* reply indicator */
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, (uint32_t)(6u + n), byte_order);
+    x11_put_u32(out_buf + 8,  root, byte_order);
+    x11_put_u32(out_buf + 12, parent, byte_order);
+    x11_put_u16(out_buf + 16, n, byte_order);
+    /* bytes 18..31 pad */
+    for (uint16_t i = 0; i < n; i++) {
+        x11_put_u32(out_buf + 32u + (size_t)i * 4u, children[i], byte_order);
+    }
+    return total;
+}
+
+/* GetAtomName reply (32 + pad4(name_len) bytes). Reply length is
+ * (24 + pad4(name_len)) / 4 = 6 + pad4(name_len)/4. */
+size_t x11_build_get_atom_name_reply(uint8_t *out_buf, size_t out_cap,
+                                     const char *name, uint16_t name_len,
+                                     uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    size_t padded = x11_pad4(name_len);
+    size_t total = 32u + padded;
+    if (out_cap < total) return 0;
+    memset(out_buf, 0, total);
+    out_buf[0] = 1u;  /* reply indicator */
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, (uint32_t)(padded / 4u + 6u), byte_order);
+    x11_put_u16(out_buf + 8, name_len, byte_order);
+    /* bytes 10..31 pad */
+    if (name_len > 0u && name != NULL) {
+        memcpy(out_buf + 32, name, name_len);
+    }
+    return total;
+}
+
+/* GetSelectionOwner reply (32 bytes). Reply length is 0; only the
+ * owner XID is returned at byte 8. */
+size_t x11_build_get_selection_owner_reply(uint8_t *out_buf,
+                                           uint32_t owner,
+                                           uint16_t sequence,
+                                           uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = 1u;  /* reply indicator */
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, 0u, byte_order);  /* reply length */
+    x11_put_u32(out_buf + 8, owner, byte_order);
+    /* bytes 12..31 pad */
+    return 32;
+}
+
+/* QueryPointer reply (32 bytes). Reply length is 0. */
+size_t x11_build_query_pointer_reply(uint8_t *out_buf,
+                                     bool same_screen,
+                                     uint32_t root, uint32_t child,
+                                     int16_t root_x, int16_t root_y,
+                                     int16_t win_x, int16_t win_y,
+                                     uint16_t mask,
+                                     uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = 1u;  /* reply indicator */
+    out_buf[1] = same_screen ? 1u : 0u;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, 0u, byte_order);  /* reply length */
+    x11_put_u32(out_buf + 8,  root, byte_order);
+    x11_put_u32(out_buf + 12, child, byte_order);
+    x11_put_u16(out_buf + 16, (uint16_t)root_x, byte_order);
+    x11_put_u16(out_buf + 18, (uint16_t)root_y, byte_order);
+    x11_put_u16(out_buf + 20, (uint16_t)win_x, byte_order);
+    x11_put_u16(out_buf + 22, (uint16_t)win_y, byte_order);
+    x11_put_u16(out_buf + 24, mask, byte_order);
+    /* bytes 26..31 pad */
+    return 32;
+}
+
+/* SelectionClear (event type 29) wire layout:
+ *   0   CARD8 code (29)
+ *   1   unused
+ *   2   CARD16 sequence
+ *   4   TIMESTAMP time
+ *   8   WINDOW owner (previous owner)
+ *   12  ATOM selection
+ *   16..31 unused */
+size_t x11_build_selection_clear(uint8_t *out_buf,
+                                 uint32_t time, uint32_t owner,
+                                 uint32_t selection_atom,
+                                 uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = X11_EV_SELECTION_CLEAR;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, time, byte_order);
+    x11_put_u32(out_buf + 8, owner, byte_order);
+    x11_put_u32(out_buf + 12, selection_atom, byte_order);
+    return 32;
+}
+
+/* SelectionRequest (event type 30) wire layout:
+ *   0   CARD8 code (30)
+ *   1   unused
+ *   2   CARD16 sequence
+ *   4   TIMESTAMP time
+ *   8   WINDOW owner
+ *   12  WINDOW requestor
+ *   16  ATOM selection
+ *   20  ATOM target
+ *   24  ATOM property
+ *   28..31 unused */
+size_t x11_build_selection_request(uint8_t *out_buf,
+                                   uint32_t time, uint32_t owner,
+                                   uint32_t requestor,
+                                   uint32_t selection_atom,
+                                   uint32_t target_atom,
+                                   uint32_t property_atom,
+                                   uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = X11_EV_SELECTION_REQUEST;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4,  time, byte_order);
+    x11_put_u32(out_buf + 8,  owner, byte_order);
+    x11_put_u32(out_buf + 12, requestor, byte_order);
+    x11_put_u32(out_buf + 16, selection_atom, byte_order);
+    x11_put_u32(out_buf + 20, target_atom, byte_order);
+    x11_put_u32(out_buf + 24, property_atom, byte_order);
+    return 32;
+}
+
+/* SelectionNotify (event type 31) wire layout:
+ *   0   CARD8 code (31)
+ *   1   unused
+ *   2   CARD16 sequence
+ *   4   TIMESTAMP time
+ *   8   WINDOW requestor
+ *   12  ATOM selection
+ *   16  ATOM target
+ *   20  ATOM property (0 if conversion failed)
+ *   24..31 unused */
+size_t x11_build_selection_notify(uint8_t *out_buf,
+                                  uint32_t time, uint32_t requestor,
+                                  uint32_t selection_atom,
+                                  uint32_t target_atom,
+                                  uint32_t property_atom,
+                                  uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = X11_EV_SELECTION_NOTIFY;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4,  time, byte_order);
+    x11_put_u32(out_buf + 8,  requestor, byte_order);
+    x11_put_u32(out_buf + 12, selection_atom, byte_order);
+    x11_put_u32(out_buf + 16, target_atom, byte_order);
+    x11_put_u32(out_buf + 20, property_atom, byte_order);
+    return 32;
+}
+
+/* GraphicsExposure (event type 13) wire layout:
+ *   0   CARD8 code (13)
+ *   1   unused
+ *   2   CARD16 sequence
+ *   4   DRAWABLE drawable
+ *   8   CARD16 x
+ *   10  CARD16 y
+ *   12  CARD16 width
+ *   14  CARD16 height
+ *   16  CARD16 minor-opcode
+ *   18  CARD16 count
+ *   20  CARD8 major-opcode
+ *   21..31 unused */
+size_t x11_build_graphics_exposure(uint8_t *out_buf,
+                                   uint32_t drawable,
+                                   uint16_t x, uint16_t y,
+                                   uint16_t width, uint16_t height,
+                                   uint16_t minor_opcode,
+                                   uint16_t count,
+                                   uint8_t major_opcode,
+                                   uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = X11_EV_GRAPHICS_EXPOSURE;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, drawable, byte_order);
+    x11_put_u16(out_buf + 8,  x, byte_order);
+    x11_put_u16(out_buf + 10, y, byte_order);
+    x11_put_u16(out_buf + 12, width, byte_order);
+    x11_put_u16(out_buf + 14, height, byte_order);
+    x11_put_u16(out_buf + 16, minor_opcode, byte_order);
+    x11_put_u16(out_buf + 18, count, byte_order);
+    out_buf[20] = major_opcode;
+    return 32;
+}
+
+/* NoExpose (event type 14) wire layout:
+ *   0   CARD8 code (14)
+ *   1   unused
+ *   2   CARD16 sequence
+ *   4   DRAWABLE drawable
+ *   8   CARD16 minor-opcode
+ *   10  CARD8 major-opcode
+ *   11..31 unused */
+size_t x11_build_no_expose(uint8_t *out_buf,
+                           uint32_t drawable,
+                           uint16_t minor_opcode,
+                           uint8_t major_opcode,
+                           uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = X11_EV_NO_EXPOSE;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, drawable, byte_order);
+    x11_put_u16(out_buf + 8, minor_opcode, byte_order);
+    out_buf[10] = major_opcode;
+    return 32;
+}

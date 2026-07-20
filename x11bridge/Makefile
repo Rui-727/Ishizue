@@ -47,9 +47,11 @@ TEST_BIN  := tests/test_x11_handshake
 TEST_SRC  := tests/test_x11_handshake.c
 TEST2_BIN := tests/test_x11_opcodes
 TEST2_SRC := tests/test_x11_opcodes.c
+TEST3_BIN := tests/test_x11_opcodes2
+TEST3_SRC := tests/test_x11_opcodes2.c
 
 .PHONY: all clean test
-all: $(BIN) $(TEST_BIN) $(TEST2_BIN)
+all: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN)
 
 $(BIN): $(OBJS)
 	@if [ ! -f ../libishizue.so ] && [ "$(BRIDGE_LDLIBS)" = "-L.. -lishizue" ]; then \
@@ -87,9 +89,17 @@ $(TEST2_BIN): $(TEST2_SRC)
 	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
 		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
 
+# W9-B integration test: exercises GetWindowAttributes, QueryTree,
+# GetAtomName, DeleteProperty, SetSelectionOwner, GetSelectionOwner,
+# QueryPointer, SetInputFocus, CreateGC, PutImage.
+$(TEST3_BIN): $(TEST3_SRC)
+	@mkdir -p tests
+	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
+		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+
 # Build + run the integration tests. Runs from the repo root so the
 # default bridge binary path (x11bridge/x11bridge) resolves.
-test: $(BIN) $(TEST_BIN) $(TEST2_BIN)
+test: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN)
 	@cd .. && \
 		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
 		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
@@ -98,7 +108,11 @@ test: $(BIN) $(TEST_BIN) $(TEST2_BIN)
 		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
 		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
 		./x11bridge/tests/test_x11_opcodes
+	@cd .. && \
+		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+		./x11bridge/tests/test_x11_opcodes2
 
 clean:
-	rm -rf $(BUILD_DIR) $(BIN) $(TEST_BIN) $(TEST2_BIN)
+	rm -rf $(BUILD_DIR) $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN)
 

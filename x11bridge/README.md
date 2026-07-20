@@ -18,11 +18,15 @@ library lands.
 - Accepts X11 client connections and replies with a real
   `setup_success` (one screen, one pixmap format, one TrueColor
   visual of depth 24).
-- Parses and dispatches ten core opcodes end-to-end:
+- Parses and dispatches twenty core opcodes end-to-end:
   - `CreateWindow` (1): allocate an Ishizue surface, set position
     and size.
   - `ChangeWindowAttributes` (2): store event-mask,
-    override-redirect, cursor.
+    override-redirect, cursor, bit/win-gravity, backing-store,
+    colormap, save-under, do-not-propagate-mask.
+  - `GetWindowAttributes` (3): reply with class, visual, map-state,
+    map-installed, override-redirect, colormap, event-mask,
+    do-not-propagate-mask from per-window state.
   - `DestroyWindow` (4): destroy the Ishizue surface, free the XID,
     recurse into children.
   - `MapWindow` (8): set_plane_type, set_plane_slot, set_output,
@@ -32,12 +36,34 @@ library lands.
   - `ConfigureWindow` (12): set_position, set_size, set_zpos, commit;
     emit ConfigureNotify.
   - `GetGeometry` (14): reply with stored depth and geometry.
+  - `QueryTree` (15): reply with the parent XID and the list of
+    child XIDs. Root's parent is 0.
   - `InternAtom` (16): bridge-global atom table with predefined
     atoms 1..68; allocate dynamic atoms from 69 up.
+  - `GetAtomName` (17): reverse atom lookup, reply with the name
+    string. BadAtom error for atom 0 or unknown atoms.
   - `ChangeProperty` (18): store (property, type, format, value) on
     the window; emit PropertyNotify.
+  - `DeleteProperty` (19): remove the property from the window;
+    emit PropertyNotify (state=Deleted).
   - `GetProperty` (20): reply with stored value, sliced by
     long-offset / long-length.
+  - `SetSelectionOwner` (22): store (selection -> owner, timestamp)
+    in a per-client table; reject stale timestamps; emit
+    SelectionClear to the previous owner if ownership changed.
+  - `GetSelectionOwner` (23): reply with the current owner XID
+    (0 if none).
+  - `QueryPointer` (38): reply with root, child, root-x/y, win-x/y,
+    button mask. Headless v1 returns (0, 0) and no buttons.
+  - `SetInputFocus` (42): store focus window and revert-to policy;
+    translate to isz_seat_set_keyboard_focus on the focused surface
+    (or surface 0 to clear).
+  - `CreateGC` (55): store a graphics context keyed by client-chosen
+    XID with the value-list attributes (graphics-exposure,
+    foreground, background, line-width, etc.).
+  - `PutImage` (72): stash the image data on the drawable as a
+    backing store (window only; root is accepted and discarded).
+    GraphicsExposure generation is skipped in v1.
 - Forwards Ishizue input events to the first mapped X11 top-level
   window:
   - `ISZ_MSG_INPUT_KEYBOARD_KEY` -> X11 `KeyPress` / `KeyRelease`.
@@ -108,23 +134,25 @@ The following are known gaps, not bugs:
 
 - No X11 error messages for unsupported opcodes. The bridge silently
   drops opcodes it does not handle (QueryExtension, GetInputFocus,
-  GetWindowAttributes, PolyText, CreatePixmap, PutImage, and most
-  others). Real X11 clients that block on a reply from those
-  opcodes will stall. Reply-bearing opcodes that the bridge does
-  handle (GetGeometry, InternAtom, GetProperty) work end-to-end.
-- No GetWindowAttributes reply. The bridge tracks attributes
-  internally but does not yet reply to opcode 3.
+  PolyText, CreatePixmap, CopyArea, and most others). Real X11
+  clients that block on a reply from those opcodes will stall.
+  Reply-bearing opcodes that the bridge does handle (GetWindowAttributes,
+  GetGeometry, QueryTree, InternAtom, GetAtomName, GetProperty,
+  GetSelectionOwner, QueryPointer) work end-to-end.
 - No focus tracking. Forwarded input events go to the first mapped
-  top-level window across all X11 clients. Real focus policy is the
-  Architect's job (SPEC §1) and would arrive as a focus field on
-  the input event once the protocol formalizes it.
+  top-level window across all X11 clients. SetInputFocus stores the
+  focus XID and translates it to a seat_set_keyboard_focus wire
+  message, but the bridge does not yet consult the focus state when
+  routing input events.
 - No buffer translation. The bridge sends no `ATTACH_BUFFER`
-  messages, so X11 `PutImage` / `CopyArea` / `ShmPutImage` etc. have
-  no effect on the Ishizue side. Surfaces are positioned and sized
-  but never painted.
+  messages. PutImage stashes the bytes on the window's backing-store
+  slot but never attaches them via `isz_surface_attach_buffer`.
+  Surfaces are positioned and sized but never painted.
 - No cursor translation. The bridge stores the cursor XID per
   window but never calls `isz_seat_set_cursor_surface`.
-- No selection / clipboard translation.
+- No selection / clipboard data transfer. SetSelectionOwner and
+  GetSelectionOwner track ownership; ConvertSelection (24),
+  SelectionRequest (30), SelectionNotify (31) are not wired.
 - No X11 extension support (XKB, XInput2, RANDR, etc.).
 - No abstract-socket bind. Linux abstract namespace
   (`@/tmp/.X11-unix/X<n>`) is not bound; libX11 falls back to the
@@ -157,6 +185,12 @@ The following are known gaps, not bugs:
   only to the client that issued the trigger request.
 - No CreateNotify. The bridge does not emit CreateNotify for new
   windows; the test does not require it.
+- No GraphicsExposure / NoExpose. PutImage (72) accepts the request
+  and stashes the data but never emits GraphicsExposure or NoExpose,
+  even when the GC has graphics-exposure=true.
+- No ConvertSelection. The bridge tracks selection ownership but
+  does not route ConvertSelection (24) to the owner or generate
+  SelectionRequest / SelectionNotify events.
 
 ## Files
 
@@ -164,13 +198,19 @@ The following are known gaps, not bugs:
 x11bridge/
   main.c             entry point, epoll loop, signal handling
   x11_proto.h/.c     X11 wire protocol constants, structs, builders
-                     for setup_success, error, GetGeometry, InternAtom,
-                     GetProperty, MapNotify, UnmapNotify,
-                     ConfigureNotify, DestroyNotify, PropertyNotify
+                     for setup_success, error, GetGeometry,
+                     GetWindowAttributes, QueryTree, InternAtom,
+                     GetAtomName, GetProperty, GetSelectionOwner,
+                     QueryPointer, MapNotify, UnmapNotify,
+                     ConfigureNotify, DestroyNotify, PropertyNotify,
+                     SelectionClear, SelectionRequest, SelectionNotify,
+                     GraphicsExposure, NoExpose
   x11_atoms.h/.c     bridge-global atom table (predefined 1..68 +
                      dynamic allocation from 69 up)
   x11_client.h/.c    per-X11-client state, setup handshake, request
-                     parser; dispatches the ten handled opcodes
+                     parser; dispatches the twenty handled opcodes;
+                     per-window properties, GC table, selection
+                     table, focus state, PutImage backing store
   isz_client.h/.c    client side of the Ishizue wire protocol
   translation.h/.c   X11 <-> Ishizue mapping (surface create/destroy,
                      set_position/set_size/set_plane_type/
@@ -186,6 +226,11 @@ x11bridge/
                               ChangeProperty, GetProperty,
                               ConfigureWindow, UnmapWindow,
                               DestroyWindow end-to-end
+  tests/test_x11_opcodes2.c   W9-B test: GetWindowAttributes,
+                              QueryTree, GetAtomName, DeleteProperty,
+                              SetSelectionOwner, GetSelectionOwner,
+                              QueryPointer, SetInputFocus, CreateGC,
+                              PutImage end-to-end
 ```
 
 ## License

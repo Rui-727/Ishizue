@@ -57,10 +57,13 @@
  * picks the same number Xorg ships, so version-checking clients pass. */
 #define X11_RELEASE_NUMBER     11800000u
 
-/* Request major opcodes the bridge handles. W8-A grows the set from
- * {CreateWindow, GetGeometry} to eight opcodes. Other opcodes the
- * scaffold must accept (QueryExtension, GetInputFocus, ...) stay in
- * the no-op default branch; see x11_client.c. */
+/* Request major opcodes the bridge handles. W8-A grew the set from
+ * {CreateWindow, GetGeometry} to ten opcodes. W9-B grows it to twenty:
+ * adds GetWindowAttributes, QueryTree, GetAtomName, DeleteProperty,
+ * SetSelectionOwner, GetSelectionOwner, QueryPointer, SetInputFocus,
+ * CreateGC, PutImage. Other opcodes the scaffold must accept
+ * (QueryExtension, GetInputFocus, ...) stay in the no-op default
+ * branch; see x11_client.c. */
 enum x11_request {
     X11_REQ_CREATE_WINDOW        = 1,
     X11_REQ_CHANGE_WINDOW_ATTRS  = 2,
@@ -70,10 +73,19 @@ enum x11_request {
     X11_REQ_UNMAP_WINDOW         = 10,
     X11_REQ_CONFIGURE_WINDOW     = 12,
     X11_REQ_GET_GEOMETRY         = 14,
+    X11_REQ_QUERY_TREE           = 15,
     X11_REQ_INTERN_ATOM          = 16,
+    X11_REQ_GET_ATOM_NAME        = 17,
     X11_REQ_CHANGE_PROPERTY      = 18,
+    X11_REQ_DELETE_PROPERTY      = 19,
     X11_REQ_GET_PROPERTY         = 20,
+    X11_REQ_SET_SELECTION_OWNER  = 22,
+    X11_REQ_GET_SELECTION_OWNER  = 23,
+    X11_REQ_QUERY_POINTER        = 38,
+    X11_REQ_SET_INPUT_FOCUS      = 42,
     X11_REQ_GET_INPUT_FOCUS      = 43,
+    X11_REQ_CREATE_GC            = 55,
+    X11_REQ_PUT_IMAGE            = 72,
     X11_REQ_QUERY_EXTENSION      = 98,
 };
 
@@ -129,11 +141,16 @@ enum x11_event {
     X11_EV_FOCUS_IN          = 9,
     X11_EV_FOCUS_OUT         = 10,
     X11_EV_EXPOSE            = 12,
+    X11_EV_GRAPHICS_EXPOSURE = 13,
+    X11_EV_NO_EXPOSE         = 14,
     X11_EV_DESTROY_NOTIFY    = 17,
     X11_EV_UNMAP_NOTIFY      = 18,
     X11_EV_MAP_NOTIFY        = 19,
     X11_EV_CONFIGURE_NOTIFY  = 22,
     X11_EV_PROPERTY_NOTIFY   = 28,
+    X11_EV_SELECTION_CLEAR   = 29,
+    X11_EV_SELECTION_REQUEST = 30,
+    X11_EV_SELECTION_NOTIFY  = 31,
 };
 
 /* event-mask bits that the bridge actually inspects when deciding
@@ -185,6 +202,58 @@ enum x11_event {
 #define X11_PROP_MODE_REPLACE 0u
 #define X11_PROP_MODE_PREPEND 1u
 #define X11_PROP_MODE_APPEND  2u
+
+/* Window map-state values reported by GetWindowAttributes. The bridge
+ * tracks only Unmapped and IsViewable: Unviewable requires a real
+ * window hierarchy, which the bridge does not have. */
+#define X11_MAP_STATE_UNMAPPED   0u
+#define X11_MAP_STATE_UNVIEWABLE 1u
+#define X11_MAP_STATE_VIEWABLE   2u
+
+/* Backing-store values reported by GetWindowAttributes. The bridge
+ * defaults to NotUseful (no backing store) unless the client set
+ * backing-store via ChangeWindowAttributes. */
+#define X11_BACKING_STORE_NOTUSEFUL  0u
+#define X11_BACKING_STORE_WHENMAPPED 1u
+#define X11_BACKING_STORE_ALWAYS     2u
+
+/* SetInputFocus revert-to values. */
+#define X11_FOCUS_REVERT_NONE        0u
+#define X11_FOCUS_REVERT_POINTER_ROOT 1u
+#define X11_FOCUS_REVERT_ANCESTOR    2u
+
+/* PutImage format values. */
+#define X11_IMAGE_FORMAT_BITMAP    0u
+#define X11_IMAGE_FORMAT_XYPIXMAP  1u
+#define X11_IMAGE_FORMAT_ZPIXMAP   2u
+
+/* CreateGC value-mask bits (X11 protocol spec, low bit first). The
+ * value-list carries one 4-byte slot per set bit, in this order. The
+ * bridge stores only the fields it inspects later (graphics-exposure
+ * for PutImage) and accepts the rest. */
+#define X11_GC_FUNCTION          0x00000001u
+#define X11_GC_PLANE_MASK        0x00000002u
+#define X11_GC_FOREGROUND        0x00000004u
+#define X11_GC_BACKGROUND        0x00000008u
+#define X11_GC_LINE_WIDTH        0x00000010u
+#define X11_GC_LINE_STYLE        0x00000020u
+#define X11_GC_CAP_STYLE         0x00000040u
+#define X11_GC_JOIN_STYLE        0x00000080u
+#define X11_GC_FILL_STYLE        0x00000100u
+#define X11_GC_FILL_RULE         0x00000200u
+#define X11_GC_TILE              0x00000400u
+#define X11_GC_STIPPLE           0x00000800u
+#define X11_GC_TILE_STIPPLE_X    0x00001000u
+#define X11_GC_TILE_STIPPLE_Y    0x00002000u
+#define X11_GC_FONT              0x00004000u
+#define X11_GC_SUBWINDOW_MODE    0x00008000u
+#define X11_GC_GRAPHICS_EXPOSURE 0x00010000u
+#define X11_GC_CLIP_X_ORIGIN     0x00020000u
+#define X11_GC_CLIP_Y_ORIGIN     0x00040000u
+#define X11_GC_CLIP_MASK         0x00080000u
+#define X11_GC_DASH_OFFSET       0x00100000u
+#define X11_GC_DASHES            0x00200000u
+#define X11_GC_ARC_MODE          0x00400000u
 
 /* Wire-layout structs. Fields are byte arrays so we can write into
  * them with x11_put_u16/u32 without alignment or aliasing concerns.
@@ -425,5 +494,114 @@ size_t   x11_build_property_notify(uint8_t *out_buf,
                                    uint32_t window, uint32_t atom,
                                    uint32_t time, uint8_t state,
                                    uint16_t sequence, uint8_t byte_order);
+
+/* Build a 44-byte GetWindowAttributes reply. Reply length is 9
+ * (36 bytes after the first 8). map_state is X11_MAP_STATE_*.
+ * colormap is 0 for CopyFromParent. */
+size_t   x11_build_get_window_attributes_reply(uint8_t *out_buf,
+                                               uint8_t backing_store,
+                                               uint32_t visual,
+                                               uint16_t class_,
+                                               uint8_t bit_gravity,
+                                               uint8_t win_gravity,
+                                               uint32_t backing_planes,
+                                               uint32_t backing_pixel,
+                                               bool override_redirect,
+                                               bool save_under,
+                                               uint8_t map_state,
+                                               bool map_installed,
+                                               uint32_t colormap,
+                                               uint32_t all_event_masks,
+                                               uint32_t your_event_mask,
+                                               uint16_t do_not_propagate_mask,
+                                               uint16_t sequence,
+                                               uint8_t byte_order);
+
+/* Build a QueryTree reply. The reply is 32 bytes plus 4 bytes per
+ * child. root is the root window the queried window lives under;
+ * parent is 0 if the queried window is the root, else the parent
+ * XID. children is an array of child XIDs; n is its length. */
+size_t   x11_build_query_tree_reply(uint8_t *out_buf, size_t out_cap,
+                                    uint32_t root, uint32_t parent,
+                                    const uint32_t *children, uint16_t n,
+                                    uint16_t sequence, uint8_t byte_order);
+
+/* Build a GetAtomName reply. The reply is 32 bytes plus the name
+ * bytes padded to 4. name_len is in bytes; name need not be
+ * NUL-terminated. Returns total bytes written, or 0 if out_cap is
+ * too small. */
+size_t   x11_build_get_atom_name_reply(uint8_t *out_buf, size_t out_cap,
+                                       const char *name, uint16_t name_len,
+                                       uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte GetSelectionOwner reply. owner is 0 if no client
+ * owns the selection. The X11 protocol does not return the timestamp
+ * in this reply; the bridge keeps it internally for stale-claim
+ * rejection on SetSelectionOwner. */
+size_t   x11_build_get_selection_owner_reply(uint8_t *out_buf,
+                                             uint32_t owner,
+                                             uint16_t sequence,
+                                             uint8_t byte_order);
+
+/* Build a 32-byte QueryPointer reply. same_screen is byte 1; root is
+ * the root window under the pointer; child is the window under the
+ * pointer (0 if outside any window); root_x/root_y are pointer
+ * coords relative to root; win_x/win_y are pointer coords relative
+ * to the queried window; mask is button + modifier state. */
+size_t   x11_build_query_pointer_reply(uint8_t *out_buf,
+                                       bool same_screen,
+                                       uint32_t root, uint32_t child,
+                                       int16_t root_x, int16_t root_y,
+                                       int16_t win_x, int16_t win_y,
+                                       uint16_t mask,
+                                       uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte SelectionClear event. Delivered to the previous
+ * owner when a new owner takes over or ownership is cleared. */
+size_t   x11_build_selection_clear(uint8_t *out_buf,
+                                   uint32_t time, uint32_t owner,
+                                   uint32_t selection_atom,
+                                   uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte SelectionRequest event. Delivered to the current
+ * owner when a requestor calls ConvertSelection. */
+size_t   x11_build_selection_request(uint8_t *out_buf,
+                                     uint32_t time, uint32_t owner,
+                                     uint32_t requestor,
+                                     uint32_t selection_atom,
+                                     uint32_t target_atom,
+                                     uint32_t property_atom,
+                                     uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte SelectionNotify event. Delivered to the requestor
+ * when the owner has finished converting a selection (property is 0
+ * if the conversion failed). */
+size_t   x11_build_selection_notify(uint8_t *out_buf,
+                                    uint32_t time, uint32_t requestor,
+                                    uint32_t selection_atom,
+                                    uint32_t target_atom,
+                                    uint32_t property_atom,
+                                    uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte GraphicsExposure event. Emitted after a CopyArea
+ * that exposes new pixels when the GC has graphics-exposure=true.
+ * count is the number of subsequent GraphicsExposure events that
+ * follow for the same request. */
+size_t   x11_build_graphics_exposure(uint8_t *out_buf,
+                                     uint32_t drawable,
+                                     uint16_t x, uint16_t y,
+                                     uint16_t width, uint16_t height,
+                                     uint16_t minor_opcode,
+                                     uint16_t count,
+                                     uint8_t major_opcode,
+                                     uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte NoExpose event. Emitted after a CopyArea that
+ * exposes no new pixels when the GC has graphics-exposure=true. */
+size_t   x11_build_no_expose(uint8_t *out_buf,
+                             uint32_t drawable,
+                             uint16_t minor_opcode,
+                             uint8_t major_opcode,
+                             uint16_t sequence, uint8_t byte_order);
 
 #endif /* X11_PROTO_H */

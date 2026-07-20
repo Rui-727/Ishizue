@@ -23,15 +23,16 @@
 
 /* x11_client.c: per-X11-client state and request parser.
  *
- * W8-A: the dispatcher now handles ten core opcodes end-to-end:
- * CreateWindow, ChangeWindowAttributes, DestroyWindow, MapWindow,
- * UnmapWindow, ConfigureWindow, GetGeometry, InternAtom,
- * ChangeProperty, GetProperty. Each handler updates the per-window
- * state, emits the corresponding Ishizue wire message(s) via
- * translation.c, and generates the relevant X11 event(s) when the
- * client selected for them. Unknown opcodes are still silently
- * consumed (logged at debug) so a client that probes extensions
- * does not stall. */
+ * W9-B: the dispatcher now handles twenty core opcodes end-to-end.
+ * The ten W8-A opcodes plus GetWindowAttributes, QueryTree,
+ * GetAtomName, DeleteProperty, SetSelectionOwner, GetSelectionOwner,
+ * QueryPointer, SetInputFocus, CreateGC, PutImage. New per-client
+ * state: GC table, selection table, keyboard focus. Each handler
+ * updates the relevant state, emits the corresponding Ishizue wire
+ * message(s) via translation.c, and generates the relevant X11
+ * event(s) when the client selected for them. Unknown opcodes are
+ * still silently consumed (logged at debug) so a client that probes
+ * extensions does not stall. */
 
 #define _GNU_SOURCE 1  /* accept4, MSG_NOSIGNAL */
 
@@ -94,14 +95,19 @@ struct x11_client *x11_client_create(int fd) {
 
 void x11_client_destroy(struct x11_client *c) {
     if (c == NULL) return;
-    /* Release any malloc'd property values on tracked windows so we
-     * do not leak on client disconnect. */
+    /* Release any malloc'd property values and PutImage backing
+     * stores on tracked windows so we do not leak on disconnect. */
     for (size_t i = 0; i < X11_CLIENT_MAX_WIN; i++) {
         if (c->windows[i].in_use) {
             x11_window_props_destroy(&c->windows[i]);
+            free(c->windows[i].backing_image);
+            c->windows[i].backing_image = NULL;
             c->windows[i].in_use = false;
         }
     }
+    /* GC and selection tables carry no malloc'd state; the slot
+     * reuse path on next CreateGC / SetSelectionOwner overwrites
+     * in place. */
     if (c->fd >= 0) {
         close(c->fd);
         c->fd = -1;
@@ -136,6 +142,11 @@ static struct x11_window *x11_client_find_window(struct x11_client *c,
         }
     }
     return NULL;
+}
+
+struct x11_window *x11_client_find_window_by_xid(struct x11_client *c,
+                                                 uint32_t x11_id) {
+    return x11_client_find_window(c, x11_id);
 }
 
 static struct x11_window *x11_client_new_window(struct x11_client *c,
@@ -274,8 +285,10 @@ static int x11_client_do_setup(struct x11_client *c) {
 
 /* Walk the value-mask + value-list of a CreateWindow (or
  * ChangeWindowAttributes) request and pull out the fields the bridge
- * actually cares about: event_mask, override_redirect, cursor. The
- * rest are accepted and discarded.
+ * actually cares about: event_mask, override_redirect, cursor,
+ * bit_gravity, win_gravity, backing_store, backing_planes,
+ * backing_pixel, save_under, colormap, do_not_propagate_mask.
+ * The rest are accepted and discarded.
  *
  * The value-list layout: one 4-byte slot per set bit in mask, in
  * order from bit 0 (background-pixmap) up to bit 14 (cursor).
@@ -294,11 +307,35 @@ static bool parse_window_value_list(const uint8_t *vp, size_t remaining,
         }
         uint32_t v = x11_get_u32(vp, byte_order);
         switch (bit) {
+        case X11_CW_BIT_GRAVITY:
+            win->bit_gravity = (uint8_t)v;
+            break;
+        case X11_CW_WIN_GRAVITY:
+            win->win_gravity = (uint8_t)v;
+            break;
+        case X11_CW_BACKING_STORE:
+            win->backing_store = (uint8_t)v;
+            break;
+        case X11_CW_BACKING_PLANES:
+            win->backing_planes = v;
+            break;
+        case X11_CW_BACKING_PIXEL:
+            win->backing_pixel = v;
+            break;
         case X11_CW_OVERRIDE_REDIRECT:
             win->override_redirect = (v != 0u);
             break;
+        case X11_CW_SAVE_UNDER:
+            win->save_under = (v != 0u);
+            break;
         case X11_CW_EVENT_MASK:
             win->event_mask = v;
+            break;
+        case X11_CW_DONT_PROPAGATE:
+            win->do_not_propagate_mask = (uint16_t)v;
+            break;
+        case X11_CW_COLORMAP:
+            win->colormap = v;
             break;
         case X11_CW_CURSOR:
             /* Store the cursor XID. v == 0 means None (inherit from
@@ -307,10 +344,9 @@ static bool parse_window_value_list(const uint8_t *vp, size_t remaining,
             win->cursor_xid = v;
             break;
         default:
-            /* Accept and discard: background, border, gravity,
-             * backing-store, save-under, do-not-propagate, colormap.
-             * The bridge does no rendering yet, so these have no
-             * Ishizue action. */
+            /* Accept and discard: background-pixmap, background-pixel,
+             * border-pixmap, border-pixel. The bridge does no
+             * rendering yet, so these have no Ishizue action. */
             break;
         }
         vp += 4u;
@@ -360,6 +396,78 @@ static struct x11_property *x11_window_prop_alloc(struct x11_window *win) {
     for (size_t i = 0; i < X11_CLIENT_MAX_PROPS; i++) {
         if (!win->props[i].in_use) {
             return &win->props[i];
+        }
+    }
+    return NULL;
+}
+
+/* Free any PutImage backing store on the window. Called on
+ * DestroyWindow and on a new PutImage that overwrites the prior. */
+static void x11_window_backing_image_clear(struct x11_window *win) {
+    if (win == NULL) return;
+    free(win->backing_image);
+    win->backing_image = NULL;
+    win->backing_image_len = 0u;
+    win->backing_image_w = 0u;
+    win->backing_image_h = 0u;
+    win->backing_image_depth = 0u;
+    win->backing_image_format = 0u;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-client graphics contexts (W9-B)                                  */
+/* ------------------------------------------------------------------ */
+
+static struct x11_gc *x11_client_find_gc(struct x11_client *c, uint32_t gc_xid) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_GCS; i++) {
+        if (c->gcs[i].in_use && c->gcs[i].gc_xid == gc_xid) {
+            return &c->gcs[i];
+        }
+    }
+    return NULL;
+}
+
+static struct x11_gc *x11_client_alloc_gc(struct x11_client *c, uint32_t gc_xid) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_GCS; i++) {
+        if (!c->gcs[i].in_use) {
+            memset(&c->gcs[i], 0, sizeof(c->gcs[i]));
+            c->gcs[i].in_use   = true;
+            c->gcs[i].gc_xid   = gc_xid;
+            /* X11 defaults: graphics_exposure=true, function=copy (0),
+             * foreground=0, background=1, line_width=0, line_style=0
+             * (Solid), fill_style=0 (Solid), subwindow_mode=0
+             * (ClipByChildren), arc_mode=0 (Chord). */
+            c->gcs[i].graphics_exposure = true;
+            c->gcs[i].foreground        = 0u;
+            c->gcs[i].background        = 1u;
+            return &c->gcs[i];
+        }
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-client selection ownership (W9-B)                                */
+/* ------------------------------------------------------------------ */
+
+static struct x11_selection *x11_client_find_selection(struct x11_client *c,
+                                                       uint32_t atom) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_SELS; i++) {
+        if (c->selections[i].in_use && c->selections[i].selection_atom == atom) {
+            return &c->selections[i];
+        }
+    }
+    return NULL;
+}
+
+static struct x11_selection *x11_client_alloc_selection(struct x11_client *c,
+                                                        uint32_t atom) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_SELS; i++) {
+        if (!c->selections[i].in_use) {
+            memset(&c->selections[i], 0, sizeof(c->selections[i]));
+            c->selections[i].in_use         = true;
+            c->selections[i].selection_atom = atom;
+            return &c->selections[i];
         }
     }
     return NULL;
@@ -441,14 +549,18 @@ static int x11_client_dispatch_request(struct x11_client *c,
         size_t vremaining = (payload_len > 28u) ? payload_len - 28u : 0u;
 
         /* Pre-fill a window struct so the value-list parser can
-         * populate event_mask and override_redirect. */
+         * populate event_mask and override_redirect. Set X11 defaults
+         * for fields the spec mandates a non-zero default for:
+         * win_gravity=NorthWest(1), backing_planes=AllPlanes(~0). */
         struct x11_window tmp;
         memset(&tmp, 0, sizeof(tmp));
-        tmp.depth         = depth;
-        tmp.window_class  = (uint8_t)cls;
-        tmp.visual_id     = visual;
-        tmp.parent_xid    = parent;
-        tmp.border_width  = border;
+        tmp.depth          = depth;
+        tmp.window_class   = (uint8_t)cls;
+        tmp.visual_id      = visual;
+        tmp.parent_xid     = parent;
+        tmp.border_width   = border;
+        tmp.win_gravity    = 1u;           /* NorthWestGravity */
+        tmp.backing_planes = 0xFFFFFFFFu;  /* AllPlanes */
 
         if (!parse_window_value_list(vp, vremaining, vmask, c->byte_order, &tmp)) {
             xc_log("warn", "CreateWindow: value-list short for mask=0x%x",
@@ -471,14 +583,22 @@ static int x11_client_dispatch_request(struct x11_client *c,
             break;
         }
         /* Copy parsed fields into the tracked window. */
-        win->depth             = tmp.depth;
-        win->window_class      = tmp.window_class;
-        win->visual_id         = tmp.visual_id;
-        win->parent_xid        = tmp.parent_xid;
-        win->border_width      = tmp.border_width;
-        win->event_mask        = tmp.event_mask;
-        win->override_redirect = tmp.override_redirect;
-        win->cursor_xid        = tmp.cursor_xid;
+        win->depth                = tmp.depth;
+        win->window_class         = tmp.window_class;
+        win->visual_id            = tmp.visual_id;
+        win->parent_xid           = tmp.parent_xid;
+        win->border_width         = tmp.border_width;
+        win->event_mask           = tmp.event_mask;
+        win->override_redirect    = tmp.override_redirect;
+        win->cursor_xid           = tmp.cursor_xid;
+        win->bit_gravity          = tmp.bit_gravity;
+        win->win_gravity          = tmp.win_gravity;
+        win->backing_store        = tmp.backing_store;
+        win->backing_planes       = tmp.backing_planes;
+        win->backing_pixel        = tmp.backing_pixel;
+        win->colormap             = tmp.colormap;
+        win->save_under           = tmp.save_under;
+        win->do_not_propagate_mask = tmp.do_not_propagate_mask;
         win->x = x;
         win->y = y;
         win->w = w;
@@ -788,6 +908,7 @@ static int x11_client_dispatch_request(struct x11_client *c,
          * whose parent_xid chain leads to this one. */
         translation_on_x11_destroy_window(isz, c, win);
         x11_window_props_destroy(win);
+        x11_window_backing_image_clear(win);
         win->in_use = false;
 
         /* Recurse: destroy all direct and indirect children. The
@@ -803,6 +924,7 @@ static int x11_client_dispatch_request(struct x11_client *c,
                     if (cw->parent_xid == window) {
                         translation_on_x11_destroy_window(isz, c, cw);
                         x11_window_props_destroy(cw);
+                        x11_window_backing_image_clear(cw);
                         cw->in_use = false;
                         changed = true;
                     }
@@ -1057,6 +1179,502 @@ static int x11_client_dispatch_request(struct x11_client *c,
                                             X11_EVMASK_PROPERTY_CHANGE,
                                             win->x11_id);
         }
+        break;
+    }
+    case X11_REQ_GET_WINDOW_ATTRS: {
+        /* GetWindowAttributes payload: 4-byte window XID. Reply is
+         * 44 bytes. The bridge fills in the per-window state it
+         * tracks; everything else defaults per X11. */
+        if (payload_len < 4u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t wid = x11_get_u32(payload, c->byte_order);
+        struct x11_window *win = x11_client_find_window(c, wid);
+        if (win == NULL) {
+            x11_client_send_error(c, X11_ERR_WINDOW, wid, opcode, 0u);
+            break;
+        }
+        uint8_t map_state = win->mapped ? X11_MAP_STATE_VIEWABLE
+                                        : X11_MAP_STATE_UNMAPPED;
+        uint8_t reply[44];
+        x11_build_get_window_attributes_reply(reply,
+                                              win->backing_store,
+                                              win->visual_id,
+                                              (uint16_t)win->window_class,
+                                              win->bit_gravity,
+                                              win->win_gravity,
+                                              win->backing_planes,
+                                              win->backing_pixel,
+                                              win->override_redirect,
+                                              win->save_under,
+                                              map_state,
+                                              win->mapped,  /* map-installed */
+                                              win->colormap,
+                                              win->event_mask,  /* all-event-masks */
+                                              win->event_mask,  /* your-event-mask */
+                                              win->do_not_propagate_mask,
+                                              seq, c->byte_order);
+        xc_log("info",
+               "GetWindowAttributes: wid=0x%x map-state=%u class=%u visual=0x%x",
+               (unsigned)wid, (unsigned)map_state, (unsigned)win->window_class,
+               (unsigned)win->visual_id);
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_QUERY_TREE: {
+        /* QueryTree payload: 4-byte window XID. Reply is 32 bytes
+         * plus 4 bytes per child. Root's parent is 0; for any other
+         * window, parent is its parent_xid. Children are all windows
+         * whose parent_xid == the queried window's x11_id. */
+        if (payload_len < 4u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t wid = x11_get_u32(payload, c->byte_order);
+        uint32_t root_xid = X11_ROOT_WINDOW_ID;
+        uint32_t parent_xid;
+        if (wid == X11_ROOT_WINDOW_ID) {
+            parent_xid = 0u;
+        } else {
+            struct x11_window *win = x11_client_find_window(c, wid);
+            if (win == NULL) {
+                x11_client_send_error(c, X11_ERR_WINDOW, wid, opcode, 0u);
+                break;
+            }
+            parent_xid = win->parent_xid;
+        }
+        /* Collect children. Cap at the buffer the bridge is willing
+         * to send: X11_CLIENT_MAX_WIN windows * 4 bytes plus the
+         * 32-byte header. */
+        uint32_t children[X11_CLIENT_MAX_WIN];
+        uint16_t n = 0u;
+        for (size_t i = 0; i < X11_CLIENT_MAX_WIN; i++) {
+            if (!c->windows[i].in_use) continue;
+            if (c->windows[i].parent_xid == wid) {
+                children[n++] = c->windows[i].x11_id;
+            }
+        }
+        uint8_t reply[32u + 4u * X11_CLIENT_MAX_WIN];
+        size_t rlen = x11_build_query_tree_reply(reply, sizeof(reply),
+                                                 root_xid, parent_xid,
+                                                 children, n,
+                                                 seq, c->byte_order);
+        xc_log("info", "QueryTree: wid=0x%x parent=0x%x children=%u",
+               (unsigned)wid, (unsigned)parent_xid, (unsigned)n);
+        if (x11_client_send_raw(c, reply, rlen) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_GET_ATOM_NAME: {
+        /* GetAtomName payload: 4-byte atom. Reply is 32 + pad4(name)
+         * bytes. Atom 0 (None) is a BadAtom error. */
+        if (payload_len < 4u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t atom = x11_get_u32(payload, c->byte_order);
+        if (atom == 0u) {
+            x11_client_send_error(c, X11_ERR_ATOM, atom, opcode, 0u);
+            break;
+        }
+        char namebuf[256];
+        size_t name_len = x11_atom_get_name(atom, namebuf, sizeof(namebuf));
+        if (name_len == 0u) {
+            /* Atom is outside the predefined range and was never
+             * interned. X11 says BadAtom. */
+            x11_client_send_error(c, X11_ERR_ATOM, atom, opcode, 0u);
+            break;
+        }
+        /* Cap name_len at u16 so the reply's name-length field fits.
+         * Predefined atoms are all short; this is a defensive cap. */
+        if (name_len > 65535u) name_len = 65535u;
+        uint8_t reply[32u + 260u];
+        size_t rlen = x11_build_get_atom_name_reply(reply, sizeof(reply),
+                                                    namebuf,
+                                                    (uint16_t)name_len,
+                                                    seq, c->byte_order);
+        xc_log("info", "GetAtomName: atom=%u -> \"%.*s\"",
+               (unsigned)atom, (int)name_len, namebuf);
+        if (x11_client_send_raw(c, reply, rlen) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_DELETE_PROPERTY: {
+        /* DeleteProperty payload: 4 window + 4 property. No reply.
+         * Emit PropertyNotify (state=Deleted) to clients that
+         * selected PropertyChange on the window. */
+        if (payload_len < 8u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t wid  = x11_get_u32(payload,     c->byte_order);
+        uint32_t prop = x11_get_u32(payload + 4, c->byte_order);
+        if (prop == 0u) {
+            x11_client_send_error(c, X11_ERR_ATOM, prop, opcode, 0u);
+            break;
+        }
+        struct x11_window *win = x11_client_find_window(c, wid);
+        if (win == NULL) {
+            x11_client_send_error(c, X11_ERR_WINDOW, wid, opcode, 0u);
+            break;
+        }
+        struct x11_property *slot = x11_window_prop_find(win, prop);
+        if (slot != NULL && slot->in_use) {
+            x11_window_prop_clear(slot);
+            uint8_t evt[32];
+            x11_build_property_notify(evt, win->x11_id, prop, 0u, 1u,
+                                      seq, c->byte_order);
+            (void)translation_deliver_event(c, evt,
+                                            X11_EVMASK_PROPERTY_CHANGE,
+                                            win->x11_id);
+        }
+        xc_log("info", "DeleteProperty: wid=0x%x prop=%u",
+               (unsigned)wid, (unsigned)prop);
+        break;
+    }
+    case X11_REQ_SET_SELECTION_OWNER: {
+        /* SetSelectionOwner payload: 4 window + 4 selection + 4 time.
+         * No reply. If timestamp is non-zero and earlier than the
+         * current ownership timestamp, ignore (stale). If window is
+         * 0, clear ownership. Generate SelectionClear to the previous
+         * owner if ownership changed. */
+        if (payload_len < 12u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t owner = x11_get_u32(payload,     c->byte_order);
+        uint32_t sel   = x11_get_u32(payload + 4, c->byte_order);
+        uint32_t time  = x11_get_u32(payload + 8, c->byte_order);
+        if (sel == 0u) {
+            x11_client_send_error(c, X11_ERR_ATOM, sel, opcode, 0u);
+            break;
+        }
+        struct x11_selection *s = x11_client_find_selection(c, sel);
+        bool stale = (s != NULL && s->in_use &&
+                      time != 0u && s->timestamp != 0u &&
+                      time < s->timestamp);
+        if (stale) {
+            xc_log("debug",
+                   "SetSelectionOwner: stale time=%u current=%u for sel=%u",
+                   (unsigned)time, (unsigned)s->timestamp, (unsigned)sel);
+            break;
+        }
+        uint32_t prev_owner = (s != NULL && s->in_use) ? s->owner_xid : 0u;
+        if (owner == 0u) {
+            /* Clear ownership. */
+            if (s != NULL) {
+                s->owner_xid = 0u;
+                s->timestamp = time;
+            }
+        } else {
+            /* The owner window must be tracked by this client. X11
+             * allows setting owner to an arbitrary window XID, but
+             * the bridge only knows about tracked windows; an
+             * unknown XID is a Window error. */
+            struct x11_window *win = x11_client_find_window(c, owner);
+            if (win == NULL) {
+                x11_client_send_error(c, X11_ERR_WINDOW, owner, opcode, 0u);
+                break;
+            }
+            if (s == NULL) {
+                s = x11_client_alloc_selection(c, sel);
+                if (s == NULL) {
+                    x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+                    break;
+                }
+            }
+            s->owner_xid = owner;
+            s->timestamp = time;
+        }
+        /* If ownership changed and there was a previous owner,
+         * deliver SelectionClear to it. SelectionClear is not subject
+         * to event-mask selection: the bridge uses required_mask=0
+         * so translation_deliver_event sends it unconditionally to
+         * the previous-owner window (if tracked). */
+        if (prev_owner != 0u && prev_owner != owner) {
+            uint8_t evt[32];
+            x11_build_selection_clear(evt, time, prev_owner, sel,
+                                      seq, c->byte_order);
+            (void)translation_deliver_event(c, evt, 0u, prev_owner);
+        }
+        xc_log("info",
+               "SetSelectionOwner: sel=%u owner=0x%x time=%u prev=0x%x",
+               (unsigned)sel, (unsigned)owner, (unsigned)time,
+               (unsigned)prev_owner);
+        break;
+    }
+    case X11_REQ_GET_SELECTION_OWNER: {
+        /* GetSelectionOwner payload: 4-byte selection atom. Reply is
+         * 32 bytes; owner is 0 if no current owner. */
+        if (payload_len < 4u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t sel = x11_get_u32(payload, c->byte_order);
+        if (sel == 0u) {
+            x11_client_send_error(c, X11_ERR_ATOM, sel, opcode, 0u);
+            break;
+        }
+        struct x11_selection *s = x11_client_find_selection(c, sel);
+        uint32_t owner = (s != NULL && s->in_use) ? s->owner_xid : 0u;
+        uint8_t reply[32];
+        x11_build_get_selection_owner_reply(reply, owner, seq, c->byte_order);
+        xc_log("info", "GetSelectionOwner: sel=%u -> owner=0x%x",
+               (unsigned)sel, (unsigned)owner);
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_QUERY_POINTER: {
+        /* QueryPointer payload: 4-byte window XID. Reply is 32 bytes.
+         * v1 headless: same_screen=1, child=0 (no window under
+         * pointer), all coords 0, mask 0. The bridge does not yet
+         * track pointer state from Ishizue input events. */
+        if (payload_len < 4u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t wid = x11_get_u32(payload, c->byte_order);
+        if (wid != X11_ROOT_WINDOW_ID) {
+            struct x11_window *win = x11_client_find_window(c, wid);
+            if (win == NULL) {
+                x11_client_send_error(c, X11_ERR_WINDOW, wid, opcode, 0u);
+                break;
+            }
+        }
+        uint8_t reply[32];
+        x11_build_query_pointer_reply(reply, true,
+                                      X11_ROOT_WINDOW_ID, 0u,
+                                      0, 0, 0, 0, 0u,
+                                      seq, c->byte_order);
+        xc_log("info", "QueryPointer: wid=0x%x -> (0,0) headless",
+               (unsigned)wid);
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_SET_INPUT_FOCUS: {
+        /* SetInputFocus payload: 1 revert-to (header byte 1 = data)
+         * + 4 focus + 4 time. No reply. Store the focus state; call
+         * isz_client_send_seat_set_keyboard_focus on the focused
+         * surface (or 0 if focus=0). */
+        uint8_t revert_to = data;
+        if (revert_to > 2u) {
+            x11_client_send_error(c, X11_ERR_VALUE, (uint32_t)revert_to,
+                                  opcode, 0u);
+            break;
+        }
+        if (payload_len < 8u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t focus = x11_get_u32(payload,     c->byte_order);
+        uint32_t time  = x11_get_u32(payload + 4, c->byte_order);
+        /* PointerRoot (1) and None (0) are always valid. Any other
+         * XID must be tracked. */
+        if (focus != 0u && focus != 1u) {
+            struct x11_window *win = x11_client_find_window(c, focus);
+            if (win == NULL) {
+                x11_client_send_error(c, X11_ERR_WINDOW, focus, opcode, 0u);
+                break;
+            }
+        }
+        c->focus_xid       = focus;
+        c->focus_revert_to = revert_to;
+        /* Translate to Ishizue seat focus. focus=0 -> surface 0
+         * (clears focus). PointerRoot (1) maps to "any surface"; the
+         * bridge has no equivalent, so it leaves the focus as-is on
+         * the library side. */
+        if (isz != NULL && focus != 1u) {
+            uint32_t surf_id = 0u;
+            if (focus != 0u) {
+                struct x11_window *fwin = x11_client_find_window(c, focus);
+                if (fwin != NULL) {
+                    surf_id = fwin->isz_surface_id;
+                }
+            }
+            (void)isz_client_send_seat_set_keyboard_focus(isz,
+                                                          isz->seat_id,
+                                                          surf_id);
+        }
+        xc_log("info",
+               "SetInputFocus: focus=0x%x revert-to=%u time=%u",
+               (unsigned)focus, (unsigned)revert_to, (unsigned)time);
+        break;
+    }
+    case X11_REQ_CREATE_GC: {
+        /* CreateGC payload: 4 gc + 4 drawable + 4 value-mask + 4n
+         * value-list. No reply. Store the GC entry. */
+        if (payload_len < 12u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t gc_xid = x11_get_u32(payload,     c->byte_order);
+        uint32_t draw   = x11_get_u32(payload + 4, c->byte_order);
+        uint32_t vmask  = x11_get_u32(payload + 8, c->byte_order);
+        size_t vremaining = (payload_len > 12u) ? payload_len - 12u : 0u;
+        /* The drawable must be tracked (a window). Pixmaps are not
+         * yet tracked; a CreateGC on a pixmap gets a Drawable error. */
+        if (draw != X11_ROOT_WINDOW_ID) {
+            struct x11_window *win = x11_client_find_window(c, draw);
+            if (win == NULL) {
+                x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
+                break;
+            }
+        }
+        if (x11_client_find_gc(c, gc_xid) != NULL) {
+            x11_client_send_error(c, X11_ERR_IDCHOICE, gc_xid, opcode, 0u);
+            break;
+        }
+        struct x11_gc *gc = x11_client_alloc_gc(c, gc_xid);
+        if (gc == NULL) {
+            x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+            break;
+        }
+        gc->drawable_xid = draw;
+        gc->value_mask   = vmask;
+        /* Validate the value-list length up front: one 4-byte slot per
+         * set bit in vmask. Counts the bits via Brian-Kernighan. */
+        uint32_t bits = vmask;
+        size_t slots_needed = 0u;
+        while (bits != 0u) {
+            bits &= bits - 1u;
+            slots_needed++;
+        }
+        if (slots_needed * 4u > vremaining) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        /* Walk the value-list and pull out the fields the bridge
+         * inspects later (graphics-exposure for PutImage). The rest
+         * is accepted and discarded. */
+        const uint8_t *vp = payload + 12u;
+        for (uint32_t bit = 1u; bit != 0u && bit <= X11_GC_ARC_MODE;
+             bit <<= 1u) {
+            if ((vmask & bit) == 0u) continue;
+            uint32_t v = x11_get_u32(vp, c->byte_order);
+            switch (bit) {
+            case X11_GC_FUNCTION:       gc->function        = (uint8_t)v; break;
+            case X11_GC_PLANE_MASK:     /* accepted, not stored */         break;
+            case X11_GC_FOREGROUND:     gc->foreground      = v;           break;
+            case X11_GC_BACKGROUND:     gc->background      = v;           break;
+            case X11_GC_LINE_WIDTH:     gc->line_width      = (uint16_t)v; break;
+            case X11_GC_LINE_STYLE:     gc->line_style      = (uint8_t)v;  break;
+            case X11_GC_CAP_STYLE:      gc->cap_style       = (uint8_t)v;  break;
+            case X11_GC_JOIN_STYLE:     gc->join_style      = (uint8_t)v;  break;
+            case X11_GC_FILL_STYLE:     gc->fill_style      = (uint8_t)v;  break;
+            case X11_GC_FILL_RULE:      gc->fill_rule       = (uint8_t)v;  break;
+            case X11_GC_TILE:           /* accepted, not stored */         break;
+            case X11_GC_STIPPLE:        /* accepted, not stored */         break;
+            case X11_GC_TILE_STIPPLE_X: /* accepted, not stored */         break;
+            case X11_GC_TILE_STIPPLE_Y: /* accepted, not stored */         break;
+            case X11_GC_FONT:           /* accepted, not stored */         break;
+            case X11_GC_SUBWINDOW_MODE: gc->subwindow_mode  = (uint8_t)v;  break;
+            case X11_GC_GRAPHICS_EXPOSURE:
+                gc->graphics_exposure = (v != 0u);
+                break;
+            case X11_GC_CLIP_X_ORIGIN:  gc->clip_x_origin   = (int16_t)v;  break;
+            case X11_GC_CLIP_Y_ORIGIN:  gc->clip_y_origin   = (int16_t)v;  break;
+            case X11_GC_CLIP_MASK:      /* accepted, not stored */         break;
+            case X11_GC_DASH_OFFSET:    /* accepted, not stored */         break;
+            case X11_GC_DASHES:         /* accepted, not stored */         break;
+            case X11_GC_ARC_MODE:       gc->arc_mode        = (uint8_t)v;  break;
+            default: break;
+            }
+            vp += 4u;
+        }
+        xc_log("info",
+               "CreateGC: gc=0x%x drawable=0x%x mask=0x%x graphics-exposure=%d",
+               (unsigned)gc_xid, (unsigned)draw, (unsigned)vmask,
+               (int)gc->graphics_exposure);
+        break;
+    }
+    case X11_REQ_PUT_IMAGE: {
+        /* PutImage payload:
+         *   1 format (header byte 1 = data)
+         *   2 length
+         *   4 drawable
+         *   4 gc
+         *   2 width
+         *   2 height
+         *   2 dst-x
+         *   2 dst-y
+         *   1 left-pad
+         *   1 depth
+         *   2 unused
+         *   n image data, padded to 4
+         * No reply. v1 stashes the data on the drawable's backing
+         * store. GraphicsExposure generation is skipped (the v1
+         * PutImage path consumes the request only). */
+        uint8_t format = data;
+        if (format > 2u) {
+            x11_client_send_error(c, X11_ERR_VALUE, (uint32_t)format,
+                                  opcode, 0u);
+            break;
+        }
+        if (payload_len < 20u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t draw    = x11_get_u32(payload,      c->byte_order);
+        uint32_t gc_xid  = x11_get_u32(payload + 4,  c->byte_order);
+        uint16_t width   = x11_get_u16(payload + 8,  c->byte_order);
+        uint16_t height  = x11_get_u16(payload + 10, c->byte_order);
+        int16_t  dst_x   = (int16_t)x11_get_u16(payload + 12, c->byte_order);
+        int16_t  dst_y   = (int16_t)x11_get_u16(payload + 14, c->byte_order);
+        uint8_t  left_pad = payload[16];
+        uint8_t  depth   = payload[17];
+        /* data bytes = total - 24 (header 4 + 20 fixed payload) */
+        size_t data_bytes = (payload_len > 20u) ? payload_len - 20u : 0u;
+        if (data_bytes > X11_PUT_IMAGE_MAX_BYTES) {
+            x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+            break;
+        }
+        (void)gc_xid; (void)dst_x; (void)dst_y; (void)left_pad;
+        /* The drawable must be a tracked window. Pixmaps are not yet
+         * tracked; a PutImage on a pixmap gets a Drawable error. */
+        struct x11_window *win = NULL;
+        if (draw == X11_ROOT_WINDOW_ID) {
+            /* Root window PutImage is allowed; the bridge does not
+             * track a backing store for root, so the data is
+             * accepted and discarded. */
+            xc_log("info",
+                   "PutImage: on root, %zu bytes discarded (no root backing)",
+                   data_bytes);
+            break;
+        }
+        win = x11_client_find_window(c, draw);
+        if (win == NULL) {
+            x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
+            break;
+        }
+        /* Stash the image data on the window. */
+        x11_window_backing_image_clear(win);
+        if (data_bytes > 0u) {
+            uint8_t *copy = malloc(data_bytes);
+            if (copy == NULL) {
+                x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+                break;
+            }
+            memcpy(copy, payload + 20u, data_bytes);
+            win->backing_image        = copy;
+            win->backing_image_len    = data_bytes;
+            win->backing_image_w      = width;
+            win->backing_image_h      = height;
+            win->backing_image_depth  = depth;
+            win->backing_image_format = format;
+        }
+        xc_log("info",
+               "PutImage: drawable=0x%x %ux%u depth=%u format=%u data=%zu",
+               (unsigned)draw, (unsigned)width, (unsigned)height,
+               (unsigned)depth, (unsigned)format, data_bytes);
         break;
     }
     default:
