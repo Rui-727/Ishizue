@@ -24,17 +24,20 @@
 /* translation.c: X11 <-> Ishizue mapping logic.
  *
  * See translation.h for the high-level shape. The X11 -> Ishizue
- * direction emits real wire messages via isz_client. The Ishizue ->
- * X11 direction emits real 32-byte X11 events via x11_client. Both
- * directions are wired end-to-end at the wire level; what is stubbed
- * is policy (focus tracking, output selection, surface id reply
- * correlation), which SPEC §1 leaves to the Architect. */
+ * direction emits real wire messages via isz_client, including
+ * SET_PLANE_TYPE / SET_PLANE_SLOT (SPEC §7.7: mandatory before
+ * commit) and SET_ZPOS for stacking changes. The Ishizue -> X11
+ * direction emits real 32-byte X11 events via x11_client. Event
+ * delivery honors the per-window event-mask the client selected via
+ * ChangeWindowAttributes. */
 
 #include "translation.h"
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+
+#include <ishizue/isz.h>
 
 #include "isz_client.h"
 #include "x11_client.h"
@@ -68,6 +71,7 @@ void translation_on_x11_create_window(struct isz_client *isz,
         tr_log("error", "surface_create send failed");
         return;
     }
+    win->has_surface = true;
     /* Send an initial position+size before the first MapWindow. */
     (void)isz_client_send_surface_set_position(isz, win->isz_surface_id,
                                                x, y);
@@ -82,13 +86,36 @@ void translation_on_x11_map_window(struct isz_client *isz,
     if (isz == NULL || win == NULL) return;
     tr_log("info", "MapWindow x11=%u isz=%u",
            (unsigned)win->x11_id, (unsigned)win->isz_surface_id);
-    /* SPEC §6.5: the bridge should bind to a real output id from the
-     * §6.5 globals. The handshake stub does not broadcast any yet, so
-     * isz->output_id stays 0. The server will reject the commit until
-     * a real output exists; that is fine for the scaffold. */
+
+    /* Only top-level windows (those with a real Ishizue surface) get
+     * scanned out. Child windows stay tracked but the bridge does not
+     * composite them in v1; the parent's next commit re-paints them. */
+    if (!win->has_surface) {
+        tr_log("debug", "MapWindow x11=%u: child window, no surface",
+               (unsigned)win->x11_id);
+        return;
+    }
+
+    /* SPEC §7.7: every surface must have a plane type and a plane
+     * slot assigned before commit, otherwise the library rejects the
+     * commit with ISZ_ERR_SURFACE_NO_PLANE_SLOT. The bridge picks
+     * PRIMARY at slot 0 for v1; the Architect can rearrange later. */
+    if (win->isz_surface_id != 0u) {
+        (void)isz_client_send_surface_set_plane_type(isz, win->isz_surface_id,
+                                                    (int)ISZ_PLANE_PRIMARY);
+        (void)isz_client_send_surface_set_plane_slot(isz, win->isz_surface_id,
+                                                    0);
+    }
+
+    /* SPEC §6.5: bind the surface to a real output id from the §6.5
+     * globals. The handshake stub does not broadcast any yet, so
+     * isz->output_id stays 0. The server will reject the commit
+     * until a real output exists; that is fine for the scaffold. */
     (void)isz_client_send_surface_set_output(isz, win->isz_surface_id,
                                              isz->output_id);
-    (void)isz_client_send_commit(isz, isz->output_id);
+    win->has_output = true;
+    (void)isz_client_send_commit_flags(isz, isz->output_id,
+                                       ISZ_COMMIT_NORMAL);
 }
 
 void translation_on_x11_unmap_window(struct isz_client *isz,
@@ -96,11 +123,19 @@ void translation_on_x11_unmap_window(struct isz_client *isz,
                                      struct x11_window *win) {
     (void)xc;
     if (isz == NULL || win == NULL) return;
-    tr_log("info", "UnmapWindow x11=%u isz=%u (stub)",
+    tr_log("info", "UnmapWindow x11=%u isz=%u",
            (unsigned)win->x11_id, (unsigned)win->isz_surface_id);
-    /* The wire protocol does not yet have a clear_output message in
-     * the public enum; ISZ_MSG_SURFACE_SET_OUTPUT with output_id 0 is
-     * the natural choice once formalized. For now we just log. */
+    if (!win->has_surface || !win->has_output) {
+        /* Nothing on the output side to undo. */
+        return;
+    }
+    /* Clear the surface's output binding and commit so the surface
+     * stops being scanned out. SET_OUTPUT with output_id 0 is the
+     * bridge's clear-output wire message (see isz_client.h). */
+    (void)isz_client_send_surface_clear_output(isz, win->isz_surface_id);
+    win->has_output = false;
+    (void)isz_client_send_commit_flags(isz, isz->output_id,
+                                       ISZ_COMMIT_NORMAL);
 }
 
 void translation_on_x11_configure_window(struct isz_client *isz,
@@ -113,10 +148,18 @@ void translation_on_x11_configure_window(struct isz_client *isz,
     tr_log("info", "ConfigureWindow x11=%u isz=%u (x=%d y=%d w=%d h=%d)",
            (unsigned)win->x11_id, (unsigned)win->isz_surface_id,
            (int)x, (int)y, (int)w, (int)h);
+    if (!win->has_surface) return;
     (void)isz_client_send_surface_set_position(isz, win->isz_surface_id,
                                                x, y);
     (void)isz_client_send_surface_set_size(isz, win->isz_surface_id,
                                            w, h);
+    /* If the window is currently scanned out, push the new geometry
+     * to the output. The bridge commits unconditionally; the server
+     * deduplicates no-op commits. */
+    if (win->has_output) {
+        (void)isz_client_send_commit_flags(isz, isz->output_id,
+                                           ISZ_COMMIT_NORMAL);
+    }
 }
 
 void translation_on_x11_destroy_window(struct isz_client *isz,
@@ -124,11 +167,52 @@ void translation_on_x11_destroy_window(struct isz_client *isz,
                                        struct x11_window *win) {
     (void)xc;
     if (isz == NULL || win == NULL) return;
-    tr_log("info", "DestroyWindow x11=%u isz=%u (stub)",
+    tr_log("info", "DestroyWindow x11=%u isz=%u",
            (unsigned)win->x11_id, (unsigned)win->isz_surface_id);
-    /* ISZ_MSG_SURFACE_DESTROY exists in the enum. Sending it would
-     * exercise the wire path; the dispatch stub does not act on it
-     * yet, so we log only. */
+    if (!win->has_surface) return;
+    /* SPEC §7.6: surface_destroy releases the server-side surface
+     * and its plane slot. The bridge does not need to clear_output
+     * first; the server tears down the output binding on destroy. */
+    (void)isz_client_send_surface_destroy(isz, win->isz_surface_id);
+    win->has_surface = false;
+    win->has_output = false;
+}
+
+/* ------------------------------------------------------------------ */
+/* Event delivery                                                      */
+/* ------------------------------------------------------------------ */
+
+/* Look up a window by X11 id in the client's table. */
+static struct x11_window *find_win(struct x11_client *xc, uint32_t xid) {
+    /* The windows table is private to x11_client.c, but the bridge
+     * already exposes x11_client_first_mapped. For event delivery
+     * we walk the same array; the struct layout is public in
+     * x11_client.h. */
+    for (size_t i = 0; i < X11_CLIENT_MAX_WIN; i++) {
+        if (xc->windows[i].in_use && xc->windows[i].x11_id == xid) {
+            return &xc->windows[i];
+        }
+    }
+    return NULL;
+}
+
+int translation_deliver_event(struct x11_client *xc,
+                               const uint8_t *evt32,
+                               uint32_t required_mask,
+                               uint32_t event_window_xid) {
+    if (xc == NULL || evt32 == NULL) return -1;
+    struct x11_window *win = find_win(xc, event_window_xid);
+    if (win == NULL) {
+        /* The destination window is not tracked (e.g. the root, or a
+         * window owned by another client). v1 has no inter-client
+         * event delivery, so drop. */
+        return 0;
+    }
+    if (required_mask != 0u && (win->event_mask & required_mask) == 0u) {
+        /* Client did not select for this event class on this window. */
+        return 0;
+    }
+    return x11_client_send_event(xc, (const struct x11_event_32 *)evt32);
 }
 
 /* ------------------------------------------------------------------ */

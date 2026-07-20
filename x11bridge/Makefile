@@ -16,10 +16,10 @@
 # (it is a wire-protocol client), but the DT_NEEDED entry is set up
 # for future use and per the W4-C spec.
 #
-# The test binary (tests/test_x11_handshake) is an integration test
-# that spawns the bridge against a headless Ishizue server running in
-# the test process. It links only the public API; no bridge internals
-# are pulled in.
+# The test binaries (tests/test_x11_handshake, tests/test_x11_opcodes)
+# are integration tests that spawn the bridge against a headless
+# Ishizue server running in the test process. They link only the
+# public API; no bridge internals are pulled in.
 
 CC      ?= cc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g
@@ -34,7 +34,7 @@ BRIDGE_LDLIBS ?= -L.. -lishizue
 TEST_LDLIBS   ?= -L.. -lishizue
 TEST_RPATH    ?= $(shell cd .. && pwd)
 
-BRIDGE_SRCS := main.c x11_proto.c x11_client.c isz_client.c translation.c
+BRIDGE_SRCS := main.c x11_proto.c x11_atoms.c x11_client.c isz_client.c translation.c
 PROTO_SRCS  := ../src/protocol/isz_protocol.c ../src/protocol/isz_conn.c
 
 BUILD_DIR   := build
@@ -42,12 +42,14 @@ BRIDGE_OBJS := $(addprefix $(BUILD_DIR)/, $(BRIDGE_SRCS:.c=.o))
 PROTO_OBJS  := $(addprefix $(BUILD_DIR)/, $(notdir $(PROTO_SRCS:.c=.o)))
 OBJS        := $(BRIDGE_OBJS) $(PROTO_OBJS)
 
-BIN      := x11bridge
-TEST_BIN := tests/test_x11_handshake
-TEST_SRC := tests/test_x11_handshake.c
+BIN       := x11bridge
+TEST_BIN  := tests/test_x11_handshake
+TEST_SRC  := tests/test_x11_handshake.c
+TEST2_BIN := tests/test_x11_opcodes
+TEST2_SRC := tests/test_x11_opcodes.c
 
 .PHONY: all clean test
-all: $(BIN) $(TEST_BIN)
+all: $(BIN) $(TEST_BIN) $(TEST2_BIN)
 
 $(BIN): $(OBJS)
 	@if [ ! -f ../libishizue.so ] && [ "$(BRIDGE_LDLIBS)" = "-L.. -lishizue" ]; then \
@@ -65,25 +67,38 @@ $(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 # Protocol sources: compile from ../src/protocol/, output .o to
-# build/ (so we do not pollute the library's source tree).
+# build/ (so we do not pollute the library source tree).
 $(BUILD_DIR)/%.o: ../src/protocol/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-# Test binary: built from tests/test_x11_handshake.c, linked against
-# libishizue.so (public API only). Does NOT link bridge objects; the
-# test spawns the bridge as a subprocess.
+# Test binaries: built from tests/*.c, linked against libishizue.so
+# (public API only). They do NOT link bridge objects; the tests
+# spawn the bridge as a subprocess.
 $(TEST_BIN): $(TEST_SRC)
 	@mkdir -p tests
 	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
 		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
 
-# Build + run the integration test. Runs from the repo root so the
+# W8-A integration test: exercises MapWindow, UnmapWindow,
+# ChangeWindowAttributes, ConfigureWindow, DestroyWindow, InternAtom,
+# ChangeProperty, GetProperty.
+$(TEST2_BIN): $(TEST2_SRC)
+	@mkdir -p tests
+	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
+		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+
+# Build + run the integration tests. Runs from the repo root so the
 # default bridge binary path (x11bridge/x11bridge) resolves.
-test: $(BIN) $(TEST_BIN)
+test: $(BIN) $(TEST_BIN) $(TEST2_BIN)
 	@cd .. && \
 		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
 		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
 		./x11bridge/tests/test_x11_handshake
+	@cd .. && \
+		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+		./x11bridge/tests/test_x11_opcodes
 
 clean:
-	rm -rf $(BUILD_DIR) $(BIN) $(TEST_BIN)
+	rm -rf $(BUILD_DIR) $(BIN) $(TEST_BIN) $(TEST2_BIN)
+

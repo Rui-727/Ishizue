@@ -244,3 +244,163 @@ size_t x11_build_get_geometry_reply(uint8_t *out_buf,
     /* bytes 22..31 unused (already zeroed). */
     return 32;
 }
+
+size_t x11_build_intern_atom_reply(uint8_t *out_buf, uint32_t atom,
+                                   uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = 1u;  /* reply indicator */
+    /* byte 1 unused */
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, 0u, byte_order);  /* reply length = 0 */
+    x11_put_u32(out_buf + 8, atom, byte_order);
+    /* bytes 12..31 unused (already zeroed). */
+    return 32;
+}
+
+size_t x11_build_get_property_reply(uint8_t *out_buf, size_t out_cap,
+                                    uint8_t format, uint32_t type,
+                                    uint32_t bytes_after,
+                                    uint32_t value_len,
+                                    const uint8_t *value, size_t value_bytes,
+                                    uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    size_t padded = x11_pad4(value_bytes);
+    if (out_cap < 32u + padded) return 0;
+    memset(out_buf, 0, 32u + padded);
+    out_buf[0] = 1u;  /* reply indicator */
+    out_buf[1] = format;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, (uint32_t)(padded / 4u), byte_order);
+    x11_put_u32(out_buf + 8, type, byte_order);
+    x11_put_u32(out_buf + 12, bytes_after, byte_order);
+    x11_put_u32(out_buf + 16, value_len, byte_order);
+    /* bytes 20..31 unused */
+    if (value_bytes > 0u && value != NULL) {
+        memcpy(out_buf + 32, value, value_bytes);
+    }
+    return 32u + padded;
+}
+
+/* MapNotify (event type 19) wire layout:
+ *   0   CARD8 code (19)
+ *   1   BOOL override-redirect
+ *   2   CARD16 sequence
+ *   4   WINDOW event
+ *   8   WINDOW window
+ *   12..31 unused */
+size_t x11_build_map_notify(uint8_t *out_buf,
+                            uint32_t event, uint32_t window,
+                            bool override_redirect,
+                            uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = X11_EV_MAP_NOTIFY;
+    out_buf[1] = override_redirect ? 1u : 0u;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, event, byte_order);
+    x11_put_u32(out_buf + 8, window, byte_order);
+    return 32;
+}
+
+/* UnmapNotify (event type 18) wire layout:
+ *   0   CARD8 code (18)
+ *   1   BOOL from-configure
+ *   2   CARD16 sequence
+ *   4   WINDOW event
+ *   8   WINDOW window
+ *   12..31 unused */
+size_t x11_build_unmap_notify(uint8_t *out_buf,
+                              uint32_t event, uint32_t window,
+                              bool from_configure,
+                              uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = X11_EV_UNMAP_NOTIFY;
+    out_buf[1] = from_configure ? 1u : 0u;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, event, byte_order);
+    x11_put_u32(out_buf + 8, window, byte_order);
+    return 32;
+}
+
+/* ConfigureNotify (event type 22) wire layout:
+ *   0   CARD8 code (22)
+ *   1   unused
+ *   2   CARD16 sequence
+ *   4   WINDOW event
+ *   8   WINDOW window
+ *   12  WINDOW above-sibling
+ *   16  INT16 x
+ *   18  INT16 y
+ *   20  CARD16 width
+ *   22  CARD16 height
+ *   24  CARD16 border-width
+ *   26  BOOL override-redirect
+ *   27..31 unused */
+size_t x11_build_configure_notify(uint8_t *out_buf,
+                                  uint32_t event, uint32_t window,
+                                  uint32_t above_sibling,
+                                  int16_t x, int16_t y,
+                                  uint16_t width, uint16_t height,
+                                  uint16_t border_width,
+                                  bool override_redirect,
+                                  uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = X11_EV_CONFIGURE_NOTIFY;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, event, byte_order);
+    x11_put_u32(out_buf + 8, window, byte_order);
+    x11_put_u32(out_buf + 12, above_sibling, byte_order);
+    x11_put_u16(out_buf + 16, (uint16_t)x, byte_order);
+    x11_put_u16(out_buf + 18, (uint16_t)y, byte_order);
+    x11_put_u16(out_buf + 20, width, byte_order);
+    x11_put_u16(out_buf + 22, height, byte_order);
+    x11_put_u16(out_buf + 24, border_width, byte_order);
+    out_buf[26] = override_redirect ? 1u : 0u;
+    return 32;
+}
+
+/* DestroyNotify (event type 17) wire layout:
+ *   0   CARD8 code (17)
+ *   1   unused
+ *   2   CARD16 sequence
+ *   4   WINDOW event
+ *   8   WINDOW window
+ *   12..31 unused */
+size_t x11_build_destroy_notify(uint8_t *out_buf,
+                                uint32_t event, uint32_t window,
+                                uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = X11_EV_DESTROY_NOTIFY;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, event, byte_order);
+    x11_put_u32(out_buf + 8, window, byte_order);
+    return 32;
+}
+
+/* PropertyNotify (event type 28) wire layout:
+ *   0   CARD8 code (28)
+ *   1   unused
+ *   2   CARD16 sequence
+ *   4   WINDOW window
+ *   8   ATOM atom
+ *   12  TIMESTAMP time
+ *   16  CARD8 state (0 NewValue, 1 Deleted)
+ *   17..31 unused */
+size_t x11_build_property_notify(uint8_t *out_buf,
+                                 uint32_t window, uint32_t atom,
+                                 uint32_t time, uint8_t state,
+                                 uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = X11_EV_PROPERTY_NOTIFY;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, window, byte_order);
+    x11_put_u32(out_buf + 8, atom, byte_order);
+    x11_put_u32(out_buf + 12, time, byte_order);
+    out_buf[16] = state;
+    return 32;
+}

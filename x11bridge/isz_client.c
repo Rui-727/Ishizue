@@ -345,11 +345,96 @@ int isz_client_send_surface_set_output(struct isz_client *c,
                            payload, sizeof(payload));
 }
 
-int isz_client_send_commit(struct isz_client *c, uint32_t output_id) {
+/* Clear the surface's output by sending SET_OUTPUT with output_id 0.
+ * The server interprets output 0 as "no output" and tears down the
+ * surface->output link. The placeholder SET_OUTPUT id stays the same. */
+int isz_client_send_surface_clear_output(struct isz_client *c,
+                                         uint32_t surface_id) {
+    return isz_client_send_surface_set_output(c, surface_id, 0u);
+}
+
+int isz_client_send_surface_set_plane_type(struct isz_client *c,
+                                            uint32_t surface_id,
+                                            int plane_type) {
+    if (c == NULL) return -1;
+    uint8_t payload[8];
+    isz_put_u32_le_local(payload,     surface_id);
+    isz_put_u32_le_local(payload + 4, (uint32_t)plane_type);
+    isz_log("debug", "surface_set_plane_type id=%u type=%d",
+            (unsigned)surface_id, plane_type);
+    return isz_client_send(c, ISZ_MSG_SURFACE_SET_PLANE_TYPE,
+                           payload, sizeof(payload));
+}
+
+int isz_client_send_surface_set_plane_slot(struct isz_client *c,
+                                            uint32_t surface_id,
+                                            int plane_slot) {
+    if (c == NULL) return -1;
+    uint8_t payload[8];
+    isz_put_u32_le_local(payload,     surface_id);
+    isz_put_u32_le_local(payload + 4, (uint32_t)plane_slot);
+    isz_log("debug", "surface_set_plane_slot id=%u slot=%d",
+            (unsigned)surface_id, plane_slot);
+    return isz_client_send(c, ISZ_MSG_SURFACE_SET_PLANE_SLOT,
+                           payload, sizeof(payload));
+}
+
+int isz_client_send_surface_set_zpos(struct isz_client *c,
+                                      uint32_t surface_id,
+                                      int32_t zpos) {
+    if (c == NULL) return -1;
+    uint8_t payload[8];
+    isz_put_u32_le_local(payload,     surface_id);
+    isz_put_i32_le_local(payload + 4, zpos);
+    isz_log("debug", "surface_set_zpos id=%u zpos=%d",
+            (unsigned)surface_id, (int)zpos);
+    return isz_client_send(c, ISZ_MSG_SURFACE_SET_ZPOS,
+                           payload, sizeof(payload));
+}
+
+int isz_client_send_surface_destroy(struct isz_client *c, uint32_t surface_id) {
     if (c == NULL) return -1;
     uint8_t payload[4];
-    isz_put_u32_le_local(payload, output_id);
-    isz_log("debug", "commit output=%u", (unsigned)output_id);
+    isz_put_u32_le_local(payload, surface_id);
+    isz_log("debug", "surface_destroy id=%u", (unsigned)surface_id);
+    return isz_client_send(c, ISZ_MSG_SURFACE_DESTROY,
+                           payload, sizeof(payload));
+}
+
+/* Seat-focus wire message: u32 seat_id, u32 surface_id (0 to clear).
+ * The server's seat object translates this into an
+ * ISZ_EVENT_INPUT_KEYBOARD_FOCUS_CHANGED event per SPEC §9. */
+int isz_client_send_seat_set_keyboard_focus(struct isz_client *c,
+                                             uint32_t seat_id,
+                                             uint32_t surface_id) {
+    if (c == NULL) return -1;
+    uint8_t payload[8];
+    isz_put_u32_le_local(payload,     seat_id);
+    isz_put_u32_le_local(payload + 4, surface_id);
+    isz_log("debug", "seat_set_keyboard_focus seat=%u surface=%u",
+            (unsigned)seat_id, (unsigned)surface_id);
+    return isz_client_send(c, ISZ_MSG_SEAT_SET_KEYBOARD_FOCUS,
+                           payload, sizeof(payload));
+}
+
+int isz_client_send_commit(struct isz_client *c, uint32_t output_id) {
+    return isz_client_send_commit_flags(c, output_id, 0u);
+}
+
+int isz_client_send_commit_flags(struct isz_client *c, uint32_t output_id,
+                                  uint32_t flags) {
+    if (c == NULL) return -1;
+    /* Provisional layout: u32 output_id, u32 flags. The original
+     * ISZ_MSG_COMMIT payload was just u32 output_id; W8-A grows it
+     * to 8 bytes so the bridge can request ISZ_COMMIT_NORMAL /
+     * ISZ_COMMIT_ASYNC / ISZ_COMMIT_TEST_ONLY per SPEC §7.3. The
+     * server's dispatch stub reads the first 4 bytes only, so older
+     * code keeps working. */
+    uint8_t payload[8];
+    isz_put_u32_le_local(payload,     output_id);
+    isz_put_u32_le_local(payload + 4, flags);
+    isz_log("debug", "commit output=%u flags=0x%x",
+            (unsigned)output_id, (unsigned)flags);
     return isz_client_send(c, ISZ_MSG_COMMIT, payload, sizeof(payload));
 }
 

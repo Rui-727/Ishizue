@@ -60,7 +60,12 @@
  * to the wire enum in W1-C). The bridge uses a placeholder value
  * picked just past the current enum range (ISZ_MSG_ERROR = 50) until
  * the per-message dispatch wave formalizes it. The server's dispatch
- * stub ignores unknown ids, so this is safe to send. */
+ * stub ignores unknown ids, so this is safe to send.
+ *
+ * ISZ_MSG_SURFACE_CLEAR_OUTPUT is the inverse: the bridge sends
+ * SET_OUTPUT with output_id 0 (None). That matches how the public
+ * API's isz_surface_clear_output maps onto the wire (the server
+ * tears down the surface->output link). */
 #define ISZ_MSG_SURFACE_SET_OUTPUT 51u
 
 struct isz_client {
@@ -96,6 +101,7 @@ ssize_t isz_client_recv(struct isz_client *c,
 /* High-level send helpers. Each encodes the message and sends it.
  * Returns 0 on success, -1 on failure (caller should disconnect). */
 int  isz_client_send_surface_create(struct isz_client *c, uint32_t *id_out);
+int  isz_client_send_surface_destroy(struct isz_client *c, uint32_t surface_id);
 int  isz_client_send_surface_set_position(struct isz_client *c,
                                           uint32_t surface_id,
                                           int32_t x, int32_t y);
@@ -105,7 +111,23 @@ int  isz_client_send_surface_set_size(struct isz_client *c,
 int  isz_client_send_surface_set_output(struct isz_client *c,
                                         uint32_t surface_id,
                                         uint32_t output_id);
+int  isz_client_send_surface_clear_output(struct isz_client *c,
+                                          uint32_t surface_id);
+int  isz_client_send_surface_set_plane_type(struct isz_client *c,
+                                            uint32_t surface_id,
+                                            int plane_type);
+int  isz_client_send_surface_set_plane_slot(struct isz_client *c,
+                                            uint32_t surface_id,
+                                            int plane_slot);
+int  isz_client_send_surface_set_zpos(struct isz_client *c,
+                                      uint32_t surface_id,
+                                      int32_t zpos);
+int  isz_client_send_seat_set_keyboard_focus(struct isz_client *c,
+                                             uint32_t seat_id,
+                                             uint32_t surface_id);
 int  isz_client_send_commit(struct isz_client *c, uint32_t output_id);
+int  isz_client_send_commit_flags(struct isz_client *c, uint32_t output_id,
+                                  uint32_t flags);
 
 /* Close the connection and free the wrapper. */
 void isz_client_destroy(struct isz_client *c);

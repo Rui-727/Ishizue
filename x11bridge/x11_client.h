@@ -11,10 +11,15 @@
  * incomplete requests, and a small table mapping X11 window ids to
  * bridge-tracked window state.
  *
- * W7-C: the bridge now completes the X11 connection setup handshake
- * for real, parses CreateWindow's value-list, and answers GetGeometry.
- * Other opcodes are accepted and silently dropped (with a debug log)
- * so a client that probes extensions does not stall the connection. */
+ * W8-A: the bridge now handles eight core opcodes end-to-end
+ * (CreateWindow, ChangeWindowAttributes, DestroyWindow, MapWindow,
+ * UnmapWindow, ConfigureWindow, GetGeometry, InternAtom,
+ * ChangeProperty, GetProperty). Real Ishizue wire messages are sent
+ * for surface create/destroy, set_output, set_position, set_size,
+ * set_plane_type, set_plane_slot, set_zpos, and commit. StructureNotify
+ * events (MapNotify, UnmapNotify, ConfigureNotify, DestroyNotify) and
+ * PropertyNotify events are generated when the client selected for
+ * them. */
 
 #ifndef X11_CLIENT_H
 #define X11_CLIENT_H
@@ -27,6 +32,20 @@
 
 #define X11_CLIENT_RECV_BUF   16384
 #define X11_CLIENT_MAX_WIN    64   /* windows tracked per client */
+#define X11_CLIENT_MAX_PROPS  16   /* properties per window */
+#define X11_PROP_MAX_BYTES    4096 /* per-property value cap */
+
+/* Per-window property: (property atom, type atom, format, value bytes).
+ * Format is 8/16/32. The value is stored as raw bytes; the caller
+ * reads/writes format-sized units. */
+struct x11_property {
+    bool      in_use;
+    uint32_t  property;   /* atom */
+    uint32_t  type;       /* atom */
+    uint8_t   format;     /* 8, 16, or 32 */
+    size_t    value_len;  /* in bytes */
+    uint8_t  *value;      /* malloc'd; freed when overwritten or window destroyed */
+};
 
 struct x11_window {
     uint32_t  x11_id;          /* X11 window id (client-chosen) */
@@ -39,9 +58,16 @@ struct x11_window {
     uint32_t  visual_id;
     uint32_t  event_mask;      /* X11 SETofEVENT the client asked for */
     uint32_t  parent_xid;      /* root for top-level, real parent otherwise */
+    uint32_t  cursor_xid;      /* 0 None means inherit from parent */
+    int32_t   zpos;            /* stacking order; bridge-assigned */
     bool      override_redirect;
     bool      mapped;
+    bool      has_surface;     /* true once an Ishizue surface has been created */
+    bool      has_output;      /* true once set_output has been sent */
     bool      in_use;
+
+    /* Property list. Linear scan; v1 client property counts are small. */
+    struct x11_property props[X11_CLIENT_MAX_PROPS];
 };
 
 struct x11_client {

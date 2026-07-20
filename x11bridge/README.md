@@ -15,24 +15,39 @@ library lands.
 - Connects to the Ishizue Unix socket and completes the §6.2
   handshake from the client side.
 - Listens on `/tmp/.X11-unix/X<display>` (default `:0`).
-- Accepts X11 client connections and replies with a minimal
-  `setup_success` (one screen, one pixmap format, no visuals).
-- Parses the 4-byte request header of each subsequent request and
-  routes the few it understands:
-  - `CreateWindow` (parent = root) -> allocate a client-side Ishizue
-    surface id and send `ISZ_MSG_SURFACE_CREATE`, then
-    `ISZ_MSG_SURFACE_SET_POSITION` and `ISZ_MSG_SURFACE_SET_SIZE`.
-  - `ConfigureWindow` -> `ISZ_MSG_SURFACE_SET_POSITION` and
-    `ISZ_MSG_SURFACE_SET_SIZE` with the new geometry.
-  - `MapWindow` -> `ISZ_MSG_SURFACE_SET_OUTPUT` and `ISZ_MSG_COMMIT`.
-  - `UnmapWindow`, `DestroyWindow` -> logged, not yet sent over the
-    wire.
+- Accepts X11 client connections and replies with a real
+  `setup_success` (one screen, one pixmap format, one TrueColor
+  visual of depth 24).
+- Parses and dispatches ten core opcodes end-to-end:
+  - `CreateWindow` (1): allocate an Ishizue surface, set position
+    and size.
+  - `ChangeWindowAttributes` (2): store event-mask,
+    override-redirect, cursor.
+  - `DestroyWindow` (4): destroy the Ishizue surface, free the XID,
+    recurse into children.
+  - `MapWindow` (8): set_plane_type, set_plane_slot, set_output,
+    commit; emit MapNotify.
+  - `UnmapWindow` (10): clear_output, commit; emit UnmapNotify; clear
+    seat keyboard focus.
+  - `ConfigureWindow` (12): set_position, set_size, set_zpos, commit;
+    emit ConfigureNotify.
+  - `GetGeometry` (14): reply with stored depth and geometry.
+  - `InternAtom` (16): bridge-global atom table with predefined
+    atoms 1..68; allocate dynamic atoms from 69 up.
+  - `ChangeProperty` (18): store (property, type, format, value) on
+    the window; emit PropertyNotify.
+  - `GetProperty` (20): reply with stored value, sliced by
+    long-offset / long-length.
 - Forwards Ishizue input events to the first mapped X11 top-level
   window:
   - `ISZ_MSG_INPUT_KEYBOARD_KEY` -> X11 `KeyPress` / `KeyRelease`.
   - `ISZ_MSG_INPUT_POINTER_MOTION` -> X11 `MotionNotify`.
   - `ISZ_MSG_INPUT_POINTER_BUTTON` -> X11 `ButtonPress` /
     `ButtonRelease`.
+- Event delivery honors the per-window `event-mask` the client set
+  via `ChangeWindowAttributes`. StructureNotify subscribers receive
+  MapNotify / UnmapNotify / ConfigureNotify / DestroyNotify;
+  PropertyChange subscribers receive PropertyNotify.
 
 ## Build
 
@@ -91,16 +106,14 @@ re-registering.
 
 The following are known gaps, not bugs:
 
-- No X11 visuals or depths are advertised. The `setup_success`
-  contains one root screen with `depths_len = 0`. Real X11 clients
-  that need a visual to create a window with a non-default visual
-  will fail.
-- No reply messages. Most X11 requests expect a reply (InternAtom,
-  GetInputFocus, QueryExtension, GetWindowAttributes, GetGeometry,
-  ...). The bridge logs and discards them. Real X11 clients that
-  block on a reply will stall at the first such request.
-- No X11 error messages. The bridge never sends an X11 error event,
-  so a client that misbehaves will not learn about it.
+- No X11 error messages for unsupported opcodes. The bridge silently
+  drops opcodes it does not handle (QueryExtension, GetInputFocus,
+  GetWindowAttributes, PolyText, CreatePixmap, PutImage, and most
+  others). Real X11 clients that block on a reply from those
+  opcodes will stall. Reply-bearing opcodes that the bridge does
+  handle (GetGeometry, InternAtom, GetProperty) work end-to-end.
+- No GetWindowAttributes reply. The bridge tracks attributes
+  internally but does not yet reply to opcode 3.
 - No focus tracking. Forwarded input events go to the first mapped
   top-level window across all X11 clients. Real focus policy is the
   Architect's job (SPEC §1) and would arrive as a focus field on
@@ -109,7 +122,8 @@ The following are known gaps, not bugs:
   messages, so X11 `PutImage` / `CopyArea` / `ShmPutImage` etc. have
   no effect on the Ishizue side. Surfaces are positioned and sized
   but never painted.
-- No cursor translation.
+- No cursor translation. The bridge stores the cursor XID per
+  window but never calls `isz_seat_set_cursor_surface`.
 - No selection / clipboard translation.
 - No X11 extension support (XKB, XInput2, RANDR, etc.).
 - No abstract-socket bind. Linux abstract namespace
@@ -137,20 +151,41 @@ The following are known gaps, not bugs:
   so the bridge has no real output id to bind surfaces to. `COMMIT`
   messages are sent with `output_id = 0` to exercise the wire path;
   the server will reject them until a real output exists.
+- No inter-client event delivery. Events that would normally go to a
+  different client (e.g. SubstructureNotify on the root for a window
+  another client created) are dropped. The bridge delivers events
+  only to the client that issued the trigger request.
+- No CreateNotify. The bridge does not emit CreateNotify for new
+  windows; the test does not require it.
 
 ## Files
 
 ```
 x11bridge/
-  main.c           entry point, epoll loop, signal handling
-  x11_proto.h/.c   minimal X11 wire protocol constants and structs,
-                   setup_success builder
-  x11_client.h/.c  per-X11-client state, setup handshake, request
-                   parser
-  isz_client.h/.c  client side of the Ishizue wire protocol
-  translation.h/.c X11 <-> Ishizue mapping
-  Makefile         builds the x11bridge binary
-  README.md        this file
+  main.c             entry point, epoll loop, signal handling
+  x11_proto.h/.c     X11 wire protocol constants, structs, builders
+                     for setup_success, error, GetGeometry, InternAtom,
+                     GetProperty, MapNotify, UnmapNotify,
+                     ConfigureNotify, DestroyNotify, PropertyNotify
+  x11_atoms.h/.c     bridge-global atom table (predefined 1..68 +
+                     dynamic allocation from 69 up)
+  x11_client.h/.c    per-X11-client state, setup handshake, request
+                     parser; dispatches the ten handled opcodes
+  isz_client.h/.c    client side of the Ishizue wire protocol
+  translation.h/.c   X11 <-> Ishizue mapping (surface create/destroy,
+                     set_position/set_size/set_plane_type/
+                     set_plane_slot/set_zpos/set_output/clear_output/
+                     commit, seat_set_keyboard_focus; event delivery)
+  Makefile           builds the x11bridge binary + integration tests
+  README.md          this file
+  tests/test_x11_handshake.c  W7-C test: setup + CreateWindow +
+                              GetGeometry end-to-end
+  tests/test_x11_opcodes.c    W8-A test: CreateWindow,
+                              ChangeWindowAttributes, MapWindow,
+                              InternAtom (WM_PROTOCOLS, PRIMARY),
+                              ChangeProperty, GetProperty,
+                              ConfigureWindow, UnmapWindow,
+                              DestroyWindow end-to-end
 ```
 
 ## License

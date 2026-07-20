@@ -12,6 +12,7 @@
 #ifndef X11_PROTO_H
 #define X11_PROTO_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -56,7 +57,10 @@
  * picks the same number Xorg ships, so version-checking clients pass. */
 #define X11_RELEASE_NUMBER     11800000u
 
-/* Request major opcodes the bridge actually handles in W7. */
+/* Request major opcodes the bridge handles. W8-A grows the set from
+ * {CreateWindow, GetGeometry} to eight opcodes. Other opcodes the
+ * scaffold must accept (QueryExtension, GetInputFocus, ...) stay in
+ * the no-op default branch; see x11_client.c. */
 enum x11_request {
     X11_REQ_CREATE_WINDOW        = 1,
     X11_REQ_CHANGE_WINDOW_ATTRS  = 2,
@@ -68,6 +72,7 @@ enum x11_request {
     X11_REQ_GET_GEOMETRY         = 14,
     X11_REQ_INTERN_ATOM          = 16,
     X11_REQ_CHANGE_PROPERTY      = 18,
+    X11_REQ_GET_PROPERTY         = 20,
     X11_REQ_GET_INPUT_FOCUS      = 43,
     X11_REQ_QUERY_EXTENSION      = 98,
 };
@@ -112,7 +117,7 @@ enum x11_error_code {
     X11_ERR_IMPLEMENTATION = 17,
 };
 
-/* Event codes (first byte of an X11 event). */
+/* X11 event codes (first byte of an X11 event). */
 enum x11_event {
     X11_EV_KEY_PRESS         = 2,
     X11_EV_KEY_RELEASE       = 3,
@@ -123,17 +128,63 @@ enum x11_event {
     X11_EV_LEAVE_NOTIFY      = 8,
     X11_EV_FOCUS_IN          = 9,
     X11_EV_FOCUS_OUT         = 10,
+    X11_EV_EXPOSE            = 12,
+    X11_EV_DESTROY_NOTIFY    = 17,
     X11_EV_UNMAP_NOTIFY      = 18,
     X11_EV_MAP_NOTIFY        = 19,
     X11_EV_CONFIGURE_NOTIFY  = 22,
+    X11_EV_PROPERTY_NOTIFY   = 28,
 };
 
-/* X11 button numbers for ButtonPress/ButtonRelease events. */
-#define X11_BUTTON_LEFT     1u
-#define X11_BUTTON_MIDDLE   2u
-#define X11_BUTTON_RIGHT    3u
-#define X11_BUTTON_SCROLL_UP    4u
-#define X11_BUTTON_SCROLL_DOWN  5u
+/* event-mask bits that the bridge actually inspects when deciding
+ * whether to deliver an event to a given client. The full
+ * SETofEVENT mask is 25 bits; the rest are accepted and ignored. */
+#define X11_EVMASK_KEY_PRESS          (1u << 0)
+#define X11_EVMASK_KEY_RELEASE        (1u << 1)
+#define X11_EVMASK_BUTTON_PRESS       (1u << 2)
+#define X11_EVMASK_BUTTON_RELEASE     (1u << 3)
+#define X11_EVMASK_ENTER_WINDOW       (1u << 4)
+#define X11_EVMASK_LEAVE_WINDOW       (1u << 5)
+#define X11_EVMASK_POINTER_MOTION     (1u << 6)
+#define X11_EVMASK_POINTER_MOTION_HINT (1u << 7)
+#define X11_EVMASK_BUTTON1_MOTION     (1u << 8)
+#define X11_EVMASK_BUTTON2_MOTION     (1u << 9)
+#define X11_EVMASK_BUTTON3_MOTION     (1u << 10)
+#define X11_EVMASK_BUTTON4_MOTION     (1u << 11)
+#define X11_EVMASK_BUTTON5_MOTION     (1u << 12)
+#define X11_EVMASK_BUTTON_MOTION      (1u << 13)
+#define X11_EVMASK_KEYMAP_STATE       (1u << 14)
+#define X11_EVMASK_EXPOSURE           (1u << 15)
+#define X11_EVMASK_VISIBILITY_CHANGE  (1u << 16)
+#define X11_EVMASK_STRUCTURE_NOTIFY   (1u << 17)
+#define X11_EVMASK_RESIZE_REDIRECT    (1u << 18)
+#define X11_EVMASK_SUBSTRUCTURE_NOTIFY (1u << 19)
+#define X11_EVMASK_SUBSTRUCTURE_REDIRECT (1u << 20)
+#define X11_EVMASK_FOCUS_CHANGE       (1u << 21)
+#define X11_EVMASK_PROPERTY_CHANGE    (1u << 22)
+#define X11_EVMASK_COLOR_MAP_CHANGE   (1u << 23)
+#define X11_EVMASK_OWNER_GRAB_BUTTON (1u << 24)
+
+/* ConfigureWindow value-mask bits (X11 protocol spec). */
+#define X11_CFG_MASK_X          0x0001u
+#define X11_CFG_MASK_Y          0x0002u
+#define X11_CFG_MASK_WIDTH      0x0004u
+#define X11_CFG_MASK_HEIGHT     0x0008u
+#define X11_CFG_MASK_BORDER_W   0x0010u
+#define X11_CFG_MASK_SIBLING    0x0020u
+#define X11_CFG_MASK_STACK_MODE 0x0040u
+
+/* ConfigureWindow stack-mode values, when X11_CFG_MASK_STACK_MODE is set. */
+#define X11_STACK_ABOVE       0u
+#define X11_STACK_BELOW       1u
+#define X11_STACK_TOP_IF      2u
+#define X11_STACK_BOTTOM_IF   3u
+#define X11_STACK_OPPOSITE    4u
+
+/* ChangeProperty mode values. */
+#define X11_PROP_MODE_REPLACE 0u
+#define X11_PROP_MODE_PREPEND 1u
+#define X11_PROP_MODE_APPEND  2u
 
 /* Wire-layout structs. Fields are byte arrays so we can write into
  * them with x11_put_u16/u32 without alignment or aliasing concerns.
@@ -303,5 +354,76 @@ size_t   x11_build_get_geometry_reply(uint8_t *out_buf,
                                       uint16_t border_width,
                                       uint16_t sequence,
                                       uint8_t byte_order);
+
+/* Build a 32-byte InternAtom reply. The reply carries only the atom
+ * value at byte 8; bytes 4..7 are the reply-length (0). atom 0 means
+ * None (only-if-exists=true and name not found). */
+size_t   x11_build_intern_atom_reply(uint8_t *out_buf, uint32_t atom,
+                                     uint16_t sequence, uint8_t byte_order);
+
+/* Build a GetProperty reply. The reply is 32 bytes plus the value
+ * bytes, padded to 4. The fixed fields are:
+ *   byte 0: 1 (reply indicator)
+ *   byte 1: format (0, 8, 16, or 32; 0 means property does not exist)
+ *   bytes 2..3: sequence
+ *   bytes 4..7: reply length in 4-byte units (n/4 where n is value bytes padded to 4)
+ *   bytes 8..11: type atom (0 if property does not exist)
+ *   bytes 12..15: bytes-after
+ *   bytes 16..19: value length in format units
+ *   bytes 20..31: unused
+ *   bytes 32..: value (n bytes), padded to 4
+ *
+ * Caller supplies format, type, bytes_after, value_len (in format
+ * units), and the value bytes. For "property does not exist",
+ * format=0/type=0/value_len=0/value=NULL. out_buf must be at least
+ * 32 + x11_pad4(value_bytes) bytes. Returns total bytes written. */
+size_t   x11_build_get_property_reply(uint8_t *out_buf, size_t out_cap,
+                                      uint8_t format, uint32_t type,
+                                      uint32_t bytes_after,
+                                      uint32_t value_len,
+                                      const uint8_t *value, size_t value_bytes,
+                                      uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte MapNotify event. event is the window that has the
+ * StructureNotify mask; window is the window that was mapped. */
+size_t   x11_build_map_notify(uint8_t *out_buf,
+                              uint32_t event, uint32_t window,
+                              bool override_redirect,
+                              uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte UnmapNotify event. event is the window that has the
+ * StructureNotify mask; window is the window that was unmapped.
+ * from_configure is byte 1 (set when the unmap was caused by
+ * ConfigureWindow on the parent's win-gravity, otherwise 0). */
+size_t   x11_build_unmap_notify(uint8_t *out_buf,
+                                uint32_t event, uint32_t window,
+                                bool from_configure,
+                                uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte ConfigureNotify event. above_sibling 0 means the
+ * window is at the bottom of the stacking order. */
+size_t   x11_build_configure_notify(uint8_t *out_buf,
+                                    uint32_t event, uint32_t window,
+                                    uint32_t above_sibling,
+                                    int16_t x, int16_t y,
+                                    uint16_t width, uint16_t height,
+                                    uint16_t border_width,
+                                    bool override_redirect,
+                                    uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte DestroyNotify event. event is the window that has
+ * the StructureNotify mask (or SubstructureNotify on the parent);
+ * window is the window being destroyed. */
+size_t   x11_build_destroy_notify(uint8_t *out_buf,
+                                  uint32_t event, uint32_t window,
+                                  uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte PropertyNotify event. state is 0 for NewValue, 1
+ * for Deleted. time is the X server timestamp; the bridge uses 0
+ * since it does not track a clock. */
+size_t   x11_build_property_notify(uint8_t *out_buf,
+                                   uint32_t window, uint32_t atom,
+                                   uint32_t time, uint8_t state,
+                                   uint16_t sequence, uint8_t byte_order);
 
 #endif /* X11_PROTO_H */

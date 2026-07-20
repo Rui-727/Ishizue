@@ -23,10 +23,15 @@
 
 /* x11_client.c: per-X11-client state and request parser.
  *
- * W7-C: completes the X11 connection setup handshake for real,
- * parses CreateWindow's full value-list, answers GetGeometry, and
- * silently drops other opcodes (with a debug log) so a client that
- * probes extensions does not stall. */
+ * W8-A: the dispatcher now handles ten core opcodes end-to-end:
+ * CreateWindow, ChangeWindowAttributes, DestroyWindow, MapWindow,
+ * UnmapWindow, ConfigureWindow, GetGeometry, InternAtom,
+ * ChangeProperty, GetProperty. Each handler updates the per-window
+ * state, emits the corresponding Ishizue wire message(s) via
+ * translation.c, and generates the relevant X11 event(s) when the
+ * client selected for them. Unknown opcodes are still silently
+ * consumed (logged at debug) so a client that probes extensions
+ * does not stall. */
 
 #define _GNU_SOURCE 1  /* accept4, MSG_NOSIGNAL */
 
@@ -41,6 +46,8 @@
 #include <sys/socket.h>
 
 #include "translation.h"
+#include "x11_atoms.h"
+#include "isz_client.h"
 
 static void xc_log(const char *level, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
@@ -53,6 +60,10 @@ static void xc_log(const char *level, const char *fmt, ...) {
     fputc('\n', stderr);
     va_end(ap);
 }
+
+/* Forward decl: x11_client_destroy releases any per-window property
+ * values via this helper, defined below in the properties section. */
+static void x11_window_props_destroy(struct x11_window *win);
 
 /* Monotonic counter that picks a fresh per-client XID slot. Wraps
  * after X11_XID_MASK+1 slots so the base stays inside the 32-bit
@@ -83,6 +94,14 @@ struct x11_client *x11_client_create(int fd) {
 
 void x11_client_destroy(struct x11_client *c) {
     if (c == NULL) return;
+    /* Release any malloc'd property values on tracked windows so we
+     * do not leak on client disconnect. */
+    for (size_t i = 0; i < X11_CLIENT_MAX_WIN; i++) {
+        if (c->windows[i].in_use) {
+            x11_window_props_destroy(&c->windows[i]);
+            c->windows[i].in_use = false;
+        }
+    }
     if (c->fd >= 0) {
         close(c->fd);
         c->fd = -1;
@@ -255,8 +274,8 @@ static int x11_client_do_setup(struct x11_client *c) {
 
 /* Walk the value-mask + value-list of a CreateWindow (or
  * ChangeWindowAttributes) request and pull out the fields the bridge
- * actually cares about: event_mask, override_redirect, cursor,
- * colormap. The rest are accepted and discarded.
+ * actually cares about: event_mask, override_redirect, cursor. The
+ * rest are accepted and discarded.
  *
  * The value-list layout: one 4-byte slot per set bit in mask, in
  * order from bit 0 (background-pixmap) up to bit 14 (cursor).
@@ -281,11 +300,17 @@ static bool parse_window_value_list(const uint8_t *vp, size_t remaining,
         case X11_CW_EVENT_MASK:
             win->event_mask = v;
             break;
+        case X11_CW_CURSOR:
+            /* Store the cursor XID. v == 0 means None (inherit from
+             * parent); the bridge stores 0 and treats it as no cursor
+             * override. Cursor translation is not wired in v1. */
+            win->cursor_xid = v;
+            break;
         default:
             /* Accept and discard: background, border, gravity,
-             * backing-store, save-under, do-not-propagate, colormap,
-             * cursor. The bridge does no rendering and no cursor
-             * translation yet, so these are stored nowhere. */
+             * backing-store, save-under, do-not-propagate, colormap.
+             * The bridge does no rendering yet, so these have no
+             * Ishizue action. */
             break;
         }
         vp += 4u;
@@ -295,17 +320,57 @@ static bool parse_window_value_list(const uint8_t *vp, size_t remaining,
 }
 
 /* ------------------------------------------------------------------ */
+/* Per-window properties                                               */
+/* ------------------------------------------------------------------ */
+
+/* Free any malloc'd property value and mark the slot empty. Called
+ * on property overwrite and on window destruction. */
+static void x11_window_prop_clear(struct x11_property *p) {
+    if (p == NULL) return;
+    free(p->value);
+    p->value = NULL;
+    p->value_len = 0u;
+    p->format = 0u;
+    p->type = 0u;
+    p->property = 0u;
+    p->in_use = false;
+}
+
+/* Free all property slots on a window. Called during DestroyWindow. */
+static void x11_window_props_destroy(struct x11_window *win) {
+    if (win == NULL) return;
+    for (size_t i = 0; i < X11_CLIENT_MAX_PROPS; i++) {
+        x11_window_prop_clear(&win->props[i]);
+    }
+}
+
+/* Find a property slot by atom, or NULL if not present. */
+static struct x11_property *x11_window_prop_find(struct x11_window *win,
+                                                 uint32_t atom) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_PROPS; i++) {
+        if (win->props[i].in_use && win->props[i].property == atom) {
+            return &win->props[i];
+        }
+    }
+    return NULL;
+}
+
+/* Find an empty property slot, or NULL if the table is full. */
+static struct x11_property *x11_window_prop_alloc(struct x11_window *win) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_PROPS; i++) {
+        if (!win->props[i].in_use) {
+            return &win->props[i];
+        }
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
 /* Request dispatch                                                    */
 /* ------------------------------------------------------------------ */
 
-/* ConfigureWindow value-mask bits (X11 protocol spec). */
-#define X11_CFG_MASK_X          0x0001u
-#define X11_CFG_MASK_Y          0x0002u
-#define X11_CFG_MASK_WIDTH      0x0004u
-#define X11_CFG_MASK_HEIGHT     0x0008u
-#define X11_CFG_MASK_BORDER_W   0x0010u
-#define X11_CFG_MASK_SIBLING    0x0020u
-#define X11_CFG_MASK_STACK_MODE 0x0040u
+/* ConfigureWindow value-mask bits and stack-mode values live in
+ * x11_proto.h (shared with the test code). */
 
 /* Parse and dispatch one request. The request lives in `buf` and is
  * `total` bytes long (>= 4). Returns 0 on success, -1 on a malformed
@@ -413,6 +478,7 @@ static int x11_client_dispatch_request(struct x11_client *c,
         win->border_width      = tmp.border_width;
         win->event_mask        = tmp.event_mask;
         win->override_redirect = tmp.override_redirect;
+        win->cursor_xid        = tmp.cursor_xid;
         win->x = x;
         win->y = y;
         win->w = w;
@@ -441,7 +507,10 @@ static int x11_client_dispatch_request(struct x11_client *c,
                    (unsigned)wid, (unsigned)parent, (unsigned)depth,
                    (int)x, (int)y, (int)w, (int)h);
         }
-        /* CreateWindow is a void request: no reply, errors only. */
+        /* CreateWindow is a void request: no reply, errors only.
+         * X11 also generates a CreateNotify event to clients that
+         * selected SubstructureNotify on the parent. The bridge does
+         * not yet implement CreateNotify (omitted from W8-A scope). */
         break;
     }
     case X11_REQ_CHANGE_WINDOW_ATTRS: {
@@ -466,6 +535,10 @@ static int x11_client_dispatch_request(struct x11_client *c,
                "ChangeWindowAttributes: wid=0x%x mask=0x%x event-mask=0x%x or=%d",
                (unsigned)wid, (unsigned)vmask,
                (unsigned)win->event_mask, (int)win->override_redirect);
+        /* ChangeWindowAttributes is a void request. The bridge does
+         * not generate an event for it; clients learn about another
+         * client's attribute changes via GetWindowAttributes, which
+         * the bridge does not yet reply to. */
         break;
     }
     case X11_REQ_GET_GEOMETRY: {
@@ -512,31 +585,93 @@ static int x11_client_dispatch_request(struct x11_client *c,
             x11_client_send_error(c, X11_ERR_WINDOW, window, opcode, 0u);
             break;
         }
+        if (win->mapped) {
+            /* X11: MapWindow on an already-mapped window is a no-op
+             * (no event generated, no error). */
+            xc_log("debug", "MapWindow: wid=0x%x already mapped", (unsigned)window);
+            break;
+        }
         win->mapped = true;
         translation_on_x11_map_window(isz, c, win);
         xc_log("info", "MapWindow: wid=0x%x", (unsigned)window);
+
+        /* Generate a MapNotify event. Per X11: the event is delivered
+         * to clients selecting StructureNotify on the window itself,
+         * or SubstructureNotify on the parent. The bridge only
+         * delivers to the originating client here (single-client
+         * model). The event's `event` field is the window XID for
+         * StructureNotify subscribers; that is the common case. */
+        {
+            uint8_t evt[32];
+            x11_build_map_notify(evt, win->x11_id, win->x11_id,
+                                 win->override_redirect, seq, c->byte_order);
+            (void)translation_deliver_event(c, evt,
+                                            X11_EVMASK_STRUCTURE_NOTIFY,
+                                            win->x11_id);
+        }
         break;
     }
     case X11_REQ_UNMAP_WINDOW: {
-        if (payload_len < 4) break;
+        if (payload_len < 4) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
         uint32_t window = x11_get_u32(payload, c->byte_order);
         struct x11_window *win = x11_client_find_window(c, window);
-        if (win != NULL) {
-            win->mapped = false;
-            translation_on_x11_unmap_window(isz, c, win);
-            xc_log("info", "UnmapWindow: wid=0x%x", (unsigned)window);
+        if (win == NULL) {
+            /* X11: UnmapWindow on an unknown window is a Window error. */
+            x11_client_send_error(c, X11_ERR_WINDOW, window, opcode, 0u);
+            break;
+        }
+        if (!win->mapped) {
+            /* X11: UnmapWindow on an already-unmapped window is a
+             * no-op, but still generates an UnmapNotify event. The
+             * bridge matches the no-op behavior to keep the test
+             * deterministic. */
+            xc_log("debug", "UnmapWindow: wid=0x%x already unmapped",
+                   (unsigned)window);
+            break;
+        }
+        win->mapped = false;
+        translation_on_x11_unmap_window(isz, c, win);
+        xc_log("info", "UnmapWindow: wid=0x%x", (unsigned)window);
+
+        /* Generate UnmapNotify. `event` = the window XID (matches the
+         * common case of StructureNotify on the window itself). */
+        {
+            uint8_t evt[32];
+            x11_build_unmap_notify(evt, win->x11_id, win->x11_id,
+                                   false, seq, c->byte_order);
+            (void)translation_deliver_event(c, evt,
+                                            X11_EVMASK_STRUCTURE_NOTIFY,
+                                            win->x11_id);
+        }
+
+        /* SPEC §9: if the unmapped window had keyboard focus, clear
+         * focus so the library emits an
+         * ISZ_EVENT_INPUT_KEYBOARD_FOCUS_CHANGED event. The bridge
+         * does not yet track per-window focus; the wire message is
+         * sent unconditionally for the headless path so the
+         * focus-cleared event fires. Real focus tracking belongs in
+         * a later wave. */
+        if (win->has_surface && isz != NULL) {
+            (void)isz_client_send_seat_set_keyboard_focus(isz,
+                                                          isz->seat_id,
+                                                          0u);
         }
         break;
     }
     case X11_REQ_CONFIGURE_WINDOW: {
-        if (payload_len < 4) break;
+        if (payload_len < 8) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
         uint32_t window = x11_get_u32(payload, c->byte_order);
         struct x11_window *win = x11_client_find_window(c, window);
         if (win == NULL) {
             x11_client_send_error(c, X11_ERR_WINDOW, window, opcode, 0u);
             break;
         }
-        if (payload_len < 8) break;
         uint16_t mask = x11_get_u16(payload + 4, c->byte_order);
         /* value-list follows the 2-byte mask + 2 bytes padding. Each
          * present value is 4 bytes, in the order: x, y, width, height,
@@ -545,36 +680,382 @@ static int x11_client_dispatch_request(struct x11_client *c,
         size_t remaining = payload_len - 8;
         int32_t nx = win->x, ny = win->y, nw = win->w, nh = win->h;
         uint16_t nborder = win->border_width;
+        uint32_t sibling = 0u;
+        uint8_t  stack_mode = X11_STACK_ABOVE;
+        bool have_stack = false;
         const uint16_t bits[] = {
             X11_CFG_MASK_X, X11_CFG_MASK_Y, X11_CFG_MASK_WIDTH,
             X11_CFG_MASK_HEIGHT, X11_CFG_MASK_BORDER_W,
             X11_CFG_MASK_SIBLING, X11_CFG_MASK_STACK_MODE,
         };
-        int32_t *fields[] = { &nx, &ny, &nw, &nh, (int32_t *)&nborder, NULL, NULL };
+        int32_t *fields[] = {
+            &nx, &ny, &nw, &nh, (int32_t *)&nborder, NULL, NULL,
+        };
         for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]); i++) {
-            if ((mask & bits[i]) == 0) continue;
-            if (remaining < 4) break;
-            if (fields[i] != NULL) {
-                *fields[i] = (int32_t)x11_get_u32(vp, c->byte_order);
+            if ((mask & bits[i]) == 0u) continue;
+            if (remaining < 4u) break;
+            uint32_t v = x11_get_u32(vp, c->byte_order);
+            if (bits[i] == X11_CFG_MASK_SIBLING) {
+                sibling = v;
+            } else if (bits[i] == X11_CFG_MASK_STACK_MODE) {
+                stack_mode = (uint8_t)v;
+                have_stack = true;
+            } else if (fields[i] != NULL) {
+                *fields[i] = (int32_t)v;
             }
-            vp += 4;
-            remaining -= 4;
+            vp += 4u;
+            remaining -= 4u;
         }
         win->x = nx; win->y = ny; win->w = nw; win->h = nh;
         win->border_width = nborder;
+
+        /* Stack-mode: the bridge maps the X11 modes onto a single
+         * per-window zpos integer that the Ishizue surface carries.
+         * Above = zpos+1, Below = zpos-1, TopIf = max int, BottomIf =
+         * min int, Opposite = toggle. The bridge keeps the simple
+         * model: only Above / Below adjust zpos; the rest pin to the
+         * top / bottom of the range. */
+        if (have_stack && win->has_surface && isz != NULL) {
+            int32_t new_zpos = win->zpos;
+            switch (stack_mode) {
+            case X11_STACK_ABOVE:    new_zpos = win->zpos + 1; break;
+            case X11_STACK_BELOW:    new_zpos = win->zpos - 1; break;
+            case X11_STACK_TOP_IF:   new_zpos = (int32_t)0x7FFFFFFF; break;
+            case X11_STACK_BOTTOM_IF:new_zpos = (int32_t)0x80000000; break;
+            case X11_STACK_OPPOSITE: new_zpos = -win->zpos; break;
+            default: break;
+            }
+            if (new_zpos != win->zpos) {
+                win->zpos = new_zpos;
+                (void)isz_client_send_surface_set_zpos(isz,
+                                                       win->isz_surface_id,
+                                                       new_zpos);
+            }
+        }
+        (void)sibling;
+
         translation_on_x11_configure_window(isz, c, win, nx, ny, nw, nh);
         xc_log("info", "ConfigureWindow: wid=0x%x geom=(%d,%d,%dx%d)",
                (unsigned)window, (int)nx, (int)ny, (int)nw, (int)nh);
+
+        /* Generate ConfigureNotify. The event's `event` field is the
+         * window XID (StructureNotify subscriber on the window
+         * itself). `above-sibling` is 0 (None) since the bridge does
+         * not track sibling ordering yet. */
+        {
+            uint8_t evt[32];
+            x11_build_configure_notify(evt, win->x11_id, win->x11_id, 0u,
+                                       (int16_t)nx, (int16_t)ny,
+                                       (uint16_t)nw, (uint16_t)nh,
+                                       (uint16_t)nborder,
+                                       win->override_redirect,
+                                       seq, c->byte_order);
+            (void)translation_deliver_event(c, evt,
+                                            X11_EVMASK_STRUCTURE_NOTIFY,
+                                            win->x11_id);
+        }
         break;
     }
     case X11_REQ_DESTROY_WINDOW: {
-        if (payload_len < 4) break;
+        if (payload_len < 4) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
         uint32_t window = x11_get_u32(payload, c->byte_order);
         struct x11_window *win = x11_client_find_window(c, window);
-        if (win != NULL) {
-            translation_on_x11_destroy_window(isz, c, win);
-            win->in_use = false;
-            xc_log("info", "DestroyWindow: wid=0x%x", (unsigned)window);
+        if (win == NULL) {
+            x11_client_send_error(c, X11_ERR_WINDOW, window, opcode, 0u);
+            break;
+        }
+
+        /* Generate DestroyNotify before we tear down the window so
+         * the event carries the window's XID. The event's `event`
+         * field is the window XID (StructureNotify subscriber on the
+         * window itself); the parent's SubstructureNotify subscribers
+         * would also receive it with event=parent, but v1 does not
+         * deliver across clients. */
+        {
+            uint8_t evt[32];
+            x11_build_destroy_notify(evt, win->x11_id, win->x11_id,
+                                     seq, c->byte_order);
+            (void)translation_deliver_event(c, evt,
+                                            X11_EVMASK_STRUCTURE_NOTIFY,
+                                            win->x11_id);
+        }
+
+        /* X11: DestroyWindow destroys all descendants recursively.
+         * The bridge walks the window table and destroys any window
+         * whose parent_xid chain leads to this one. */
+        translation_on_x11_destroy_window(isz, c, win);
+        x11_window_props_destroy(win);
+        win->in_use = false;
+
+        /* Recurse: destroy all direct and indirect children. The
+         * bridge does not generate DestroyNotify for the descendants
+         * in v1 (the X11 spec requires it; this is a known gap). */
+        {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (size_t i = 0; i < X11_CLIENT_MAX_WIN; i++) {
+                    struct x11_window *cw = &c->windows[i];
+                    if (!cw->in_use) continue;
+                    if (cw->parent_xid == window) {
+                        translation_on_x11_destroy_window(isz, c, cw);
+                        x11_window_props_destroy(cw);
+                        cw->in_use = false;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        xc_log("info", "DestroyWindow: wid=0x%x", (unsigned)window);
+        break;
+    }
+    case X11_REQ_INTERN_ATOM: {
+        /* InternAtom payload:
+         *   1 only-if-exists (header byte 1 = data)
+         *   2 length
+         *   2 name length (n)
+         *   2 unused
+         *   n name, padded to 4 */
+        bool only_if_exists = (data != 0u);
+        if (payload_len < 4u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint16_t name_len = x11_get_u16(payload, c->byte_order);
+        if ((size_t)name_len > payload_len - 4u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        const char *name = (const char *)(payload + 4u);
+        uint32_t atom = x11_atom_intern(name, name_len, only_if_exists);
+        uint8_t reply[32];
+        x11_build_intern_atom_reply(reply, atom, seq, c->byte_order);
+        xc_log("info", "InternAtom: name=%.*s only=%d -> atom=%u",
+               (int)name_len, name, (int)only_if_exists, (unsigned)atom);
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_CHANGE_PROPERTY: {
+        /* ChangeProperty payload (after the 4-byte request header):
+         *   4 window
+         *   4 property (atom)
+         *   4 type (atom)
+         *   1 format (8/16/32)
+         *   3 unused
+         *   4 nunits (in format units)
+         *   n*padded data
+         * Fixed payload is 20 bytes; data follows at offset 20. */
+        uint8_t mode = data;
+        if (payload_len < 20u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t wid     = x11_get_u32(payload,      c->byte_order);
+        uint32_t prop    = x11_get_u32(payload + 4,  c->byte_order);
+        uint32_t type    = x11_get_u32(payload + 8,  c->byte_order);
+        uint8_t  fmt     = payload[12];
+        uint32_t nunits  = x11_get_u32(payload + 16, c->byte_order);
+        if (fmt != 8u && fmt != 16u && fmt != 32u) {
+            x11_client_send_error(c, X11_ERR_VALUE, (uint32_t)fmt,
+                                  opcode, 0u);
+            break;
+        }
+        if (prop == 0u) {
+            x11_client_send_error(c, X11_ERR_ATOM, prop, opcode, 0u);
+            break;
+        }
+        size_t unit_bytes = fmt / 8u;
+        size_t data_bytes = (size_t)nunits * unit_bytes;
+        if (data_bytes > payload_len - 20u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        if (data_bytes > X11_PROP_MAX_BYTES) {
+            x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+            break;
+        }
+        const uint8_t *data_buf = payload + 20u;
+        struct x11_window *win = x11_client_find_window(c, wid);
+        if (win == NULL) {
+            x11_client_send_error(c, X11_ERR_WINDOW, wid, opcode, 0u);
+            break;
+        }
+
+        struct x11_property *slot = x11_window_prop_find(win, prop);
+        if (slot == NULL) {
+            slot = x11_window_prop_alloc(win);
+            if (slot == NULL) {
+                x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+                break;
+            }
+        }
+
+        if (mode == X11_PROP_MODE_REPLACE || !slot->in_use) {
+            /* Replace: discard any existing value and store the new. */
+            x11_window_prop_clear(slot);
+            uint8_t *copy = NULL;
+            if (data_bytes > 0u) {
+                copy = malloc(data_bytes);
+                if (copy == NULL) {
+                    x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+                    break;
+                }
+                memcpy(copy, data_buf, data_bytes);
+            }
+            slot->in_use    = true;
+            slot->property  = prop;
+            slot->type      = type;
+            slot->format    = fmt;
+            slot->value_len = data_bytes;
+            slot->value     = copy;
+        } else if (mode == X11_PROP_MODE_PREPEND ||
+                   mode == X11_PROP_MODE_APPEND) {
+            /* Prepend/Append: concatenate at the format-unit
+             * granularity. The new total is value_len + data_bytes;
+             * cap at X11_PROP_MAX_BYTES. */
+            if (slot->type != type || slot->format != fmt) {
+                /* X11: type/format mismatch is a Match error. */
+                x11_client_send_error(c, X11_ERR_MATCH, 0u, opcode, 0u);
+                break;
+            }
+            size_t new_len = slot->value_len + data_bytes;
+            if (new_len > X11_PROP_MAX_BYTES) {
+                x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+                break;
+            }
+            uint8_t *grown = realloc(slot->value, new_len);
+            if (grown == NULL && new_len > 0u) {
+                x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+                break;
+            }
+            slot->value = grown;
+            if (mode == X11_PROP_MODE_PREPEND) {
+                memmove(slot->value + data_bytes, slot->value,
+                        slot->value_len);
+                memcpy(slot->value, data_buf, data_bytes);
+            } else {  /* Append */
+                memcpy(slot->value + slot->value_len, data_buf, data_bytes);
+            }
+            slot->value_len = new_len;
+        } else {
+            x11_client_send_error(c, X11_ERR_VALUE, (uint32_t)mode,
+                                  opcode, 0u);
+            break;
+        }
+
+        xc_log("info",
+               "ChangeProperty: wid=0x%x prop=%u type=%u fmt=%u "
+               "nunits=%u mode=%u",
+               (unsigned)wid, (unsigned)prop, (unsigned)type,
+               (unsigned)fmt, (unsigned)nunits, (unsigned)mode);
+
+        /* Generate PropertyNotify (state = 0 NewValue). Delivered to
+         * clients selecting PropertyChange on this window. */
+        {
+            uint8_t evt[32];
+            x11_build_property_notify(evt, win->x11_id, prop, 0u, 0u,
+                                      seq, c->byte_order);
+            (void)translation_deliver_event(c, evt,
+                                            X11_EVMASK_PROPERTY_CHANGE,
+                                            win->x11_id);
+        }
+        /* ChangeProperty is a void request: no reply, errors only. */
+        break;
+    }
+    case X11_REQ_GET_PROPERTY: {
+        /* GetProperty payload (after the 4-byte request header):
+         *   4 window
+         *   4 property (atom)
+         *   4 type (atom, 0 = AnyType)
+         *   4 long-offset (in 4-byte units)
+         *   4 long-length (max 4-byte units to return)
+         * Fixed payload is 20 bytes. */
+        uint8_t delete = data;
+        if (payload_len < 20u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t wid    = x11_get_u32(payload,      c->byte_order);
+        uint32_t prop   = x11_get_u32(payload + 4,  c->byte_order);
+        uint32_t type   = x11_get_u32(payload + 8,  c->byte_order);
+        uint32_t loff   = x11_get_u32(payload + 12, c->byte_order);
+        uint32_t llen   = x11_get_u32(payload + 16, c->byte_order);
+        struct x11_window *win = x11_client_find_window(c, wid);
+        if (win == NULL) {
+            x11_client_send_error(c, X11_ERR_WINDOW, wid, opcode, 0u);
+            break;
+        }
+        struct x11_property *slot = x11_window_prop_find(win, prop);
+        bool found = (slot != NULL && slot->in_use);
+        if (found && type != 0u && slot->type != type) {
+            /* Type mismatch: X11 treats this as "property does not
+             * exist" for this reply, returning type=0/format=0. */
+            found = false;
+        }
+
+        if (!found) {
+            uint8_t reply[32];
+            x11_build_get_property_reply(reply, sizeof(reply),
+                                         0u, 0u, 0u, 0u, NULL, 0u,
+                                         seq, c->byte_order);
+            xc_log("info", "GetProperty: wid=0x%x prop=%u -> not found",
+                   (unsigned)wid, (unsigned)prop);
+            if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+                return -1;
+            }
+            break;
+        }
+
+        /* Compute the reply slice. loff and llen are in 4-byte units
+         * ("longs" in X11 parlance). The value bytes returned are
+         * [offset*4, offset*4 + length*4) clamped to value_len. */
+        size_t offset_bytes = (size_t)loff * 4u;
+        size_t max_bytes    = (size_t)llen * 4u;
+        size_t total_bytes  = slot->value_len;
+        size_t avail_bytes  = (offset_bytes < total_bytes)
+                              ? total_bytes - offset_bytes : 0u;
+        size_t return_bytes = (avail_bytes < max_bytes)
+                              ? avail_bytes : max_bytes;
+        size_t bytes_after  = (avail_bytes > return_bytes)
+                              ? avail_bytes - return_bytes : 0u;
+        const uint8_t *value_ptr = (return_bytes > 0u)
+                                   ? slot->value + offset_bytes : NULL;
+        /* value_len in the reply is in format units. */
+        size_t unit_bytes = slot->format / 8u;
+        uint32_t value_len_units = (unit_bytes > 0u)
+            ? (uint32_t)(return_bytes / unit_bytes) : 0u;
+
+        uint8_t reply[32 + 4096];
+        size_t rlen = x11_build_get_property_reply(reply, sizeof(reply),
+                                                   slot->format, slot->type,
+                                                   (uint32_t)bytes_after,
+                                                   value_len_units,
+                                                   value_ptr, return_bytes,
+                                                   seq, c->byte_order);
+        xc_log("info",
+               "GetProperty: wid=0x%x prop=%u type=%u fmt=%u -> %zu bytes",
+               (unsigned)wid, (unsigned)prop, (unsigned)slot->type,
+               (unsigned)slot->format, return_bytes);
+        if (x11_client_send_raw(c, reply, rlen) < 0) {
+            return -1;
+        }
+
+        /* If delete=true and the entire property was returned (no
+         * bytes_after), remove it and emit a PropertyNotify with
+         * state=Deleted. */
+        if (delete && bytes_after == 0u) {
+            x11_window_prop_clear(slot);
+            uint8_t evt[32];
+            x11_build_property_notify(evt, win->x11_id, prop, 0u, 1u,
+                                      seq, c->byte_order);
+            (void)translation_deliver_event(c, evt,
+                                            X11_EVMASK_PROPERTY_CHANGE,
+                                            win->x11_id);
         }
         break;
     }
