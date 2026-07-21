@@ -51,7 +51,34 @@
  * has graphics-exposure=false. PolyFillRectangle validates drawable
  * and gc and discards the rectangle list. GetImage returns the
  * backing image rect for a ZPixmap depth-24 window; elsewhere
- * returns zeros. FreeGC marks the GC slot free. */
+ * returns zeros. FreeGC marks the GC slot free.
+ *
+ * W11-A: twelve font and text opcodes added (OpenFont, CloseFont,
+ * QueryFont, QueryTextExtents, ListFonts, ListFontsWithInfo,
+ * SetFontPath, GetFontPath, PolyText8, PolyText16, ImageText8,
+ * ImageText16). Per-client state gained a font table. The bridge
+ * ships no font database: OpenFont stores the name only, QueryFont
+ * returns a 60-byte reply with all metrics zeroed, QueryTextExtents
+ * returns a 32-byte reply with all metrics zeroed, ListFonts returns
+ * an empty list, ListFontsWithInfo sends only the terminator reply,
+ * GetFontPath returns npaths=0, SetFontPath / PolyText8 / PolyText16
+ * / ImageText8 / ImageText16 accept and discard their payloads.
+ * BadFont is sent when QueryFont / QueryTextExtents target a font XID
+ * the bridge does not track. CloseFont on an unknown XID is a silent
+ * no-op per X11.
+ *
+ * W11-B: five cursor / misc opcodes added (CreateCursor,
+ * CreateGlyphCursor, FreeCursor, RecolorCursor, QueryBestSize).
+ * Per-client state gained a cursor table. The bridge does no real
+ * cursor rendering in v1; CreateCursor stores the source pixmap and
+ * mask, CreateGlyphCursor stores the source font and glyph indices,
+ * RecolorCursor updates the colors in place, and FreeCursor releases
+ * the slot. BadCursor is sent when RecolorCursor / FreeCursor target
+ * a cursor XID the bridge does not track; BadPixmap / BadFont /
+ * BadIDChoice are sent on the corresponding CreateCursor /
+ * CreateGlyphCursor validation failures. QueryBestSize echoes back
+ * the requested width and height unchanged because the bridge has no
+ * hardware cursor / tile / stipple size limits. */
 
 #define _GNU_SOURCE 1  /* accept4, MSG_NOSIGNAL */
 
@@ -547,6 +574,61 @@ static struct x11_colormap *x11_client_alloc_colormap(struct x11_client *c,
             c->colormaps[i].in_use       = true;
             c->colormaps[i].colormap_xid = cmap_xid;
             return &c->colormaps[i];
+        }
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-client fonts (W11-A)                                            */
+/* ------------------------------------------------------------------ */
+
+static struct x11_font *x11_client_find_font(struct x11_client *c,
+                                              uint32_t font_xid) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_FONTS; i++) {
+        if (c->fonts[i].in_use && c->fonts[i].font_xid == font_xid) {
+            return &c->fonts[i];
+        }
+    }
+    return NULL;
+}
+
+static struct x11_font *x11_client_alloc_font(struct x11_client *c,
+                                              uint32_t font_xid) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_FONTS; i++) {
+        if (!c->fonts[i].in_use) {
+            memset(&c->fonts[i], 0, sizeof(c->fonts[i]));
+            c->fonts[i].in_use   = true;
+            c->fonts[i].font_xid = font_xid;
+            return &c->fonts[i];
+        }
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-client cursors (W11-B)                                          */
+/* ------------------------------------------------------------------ */
+
+static struct x11_cursor *x11_client_find_cursor(struct x11_client *c,
+                                                 uint32_t cursor_xid) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_CURSORS; i++) {
+        if (c->cursors[i].in_use &&
+            c->cursors[i].cursor_xid == cursor_xid) {
+            return &c->cursors[i];
+        }
+    }
+    return NULL;
+}
+
+static struct x11_cursor *x11_client_alloc_cursor(struct x11_client *c,
+                                                   uint32_t cursor_xid) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_CURSORS; i++) {
+        if (!c->cursors[i].in_use) {
+            memset(&c->cursors[i], 0, sizeof(c->cursors[i]));
+            c->cursors[i].in_use     = true;
+            c->cursors[i].cursor_xid = cursor_xid;
+            return &c->cursors[i];
         }
     }
     return NULL;
@@ -2268,6 +2350,570 @@ static int x11_client_dispatch_request(struct x11_client *c,
         /* All zero: black. */
         xc_log("info", "LookupColor: cmap=0x%x name_len=%u -> black",
                (unsigned)cmap, (unsigned)name_len);
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_OPEN_FONT: {  /* 45 */
+        /* OpenFont payload (after the 4-byte header):
+         *   4 font (client-allocated XID)
+         *   2 name_len
+         *   2 unused
+         *   name_len bytes of name, padded to 4
+         * Total = 12 + pad4(name_len) bytes request. No reply. v1
+         * stores the name only; no real font is loaded. */
+        if (total < 12u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t font_xid  = x11_get_u32(buf + 4, c->byte_order);
+        uint16_t name_len  = x11_get_u16(buf + 8, c->byte_order);
+        size_t name_padded = (total > 12u) ? total - 12u : 0u;
+        if ((size_t)name_len > name_padded) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        if (name_len >= X11_FONT_NAME_MAX) {
+            x11_client_send_error(c, X11_ERR_NAME, 0u, opcode, 0u);
+            break;
+        }
+        if (x11_client_find_font(c, font_xid) != NULL) {
+            x11_client_send_error(c, X11_ERR_IDCHOICE, font_xid, opcode, 0u);
+            break;
+        }
+        struct x11_font *f = x11_client_alloc_font(c, font_xid);
+        if (f == NULL) {
+            x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+            break;
+        }
+        if (name_len > 0u) {
+            memcpy(f->name, buf + 12u, name_len);
+        }
+        f->name[name_len] = '\0';
+        f->name_len = name_len;
+        xc_log("info", "OpenFont: font=0x%x name=\"%s\" len=%u",
+               (unsigned)font_xid, f->name, (unsigned)name_len);
+        break;
+    }
+    case X11_REQ_CLOSE_FONT: {  /* 46 */
+        /* CloseFont payload: 4 font. Total 8 bytes. No reply. Per
+         * X11: closing an already-closed font is not an error, so an
+         * unknown XID is a silent no-op. */
+        if (total < 8u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t font_xid = x11_get_u32(buf + 4, c->byte_order);
+        struct x11_font *f = x11_client_find_font(c, font_xid);
+        if (f != NULL) {
+            f->in_use = false;
+            xc_log("info", "CloseFont: font=0x%x closed", (unsigned)font_xid);
+        } else {
+            xc_log("debug",
+                   "CloseFont: font=0x%x not tracked (silent no-op)",
+                   (unsigned)font_xid);
+        }
+        break;
+    }
+    case X11_REQ_QUERY_FONT: {  /* 47 */
+        /* QueryFont payload: 4 fontable (font or gc). Total 8 bytes.
+         * Reply: 60 bytes (8-byte header + 52 bytes of metrics), all
+         * zeroed, with reply-length = 13. v1 ships no font database:
+         * all metrics are zero, n-font-props = 0, char-infos-count =
+         * 0. If the fontable XID is neither a tracked font nor a
+         * tracked GC, BadFont. */
+        if (total < 8u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t font_xid = x11_get_u32(buf + 4, c->byte_order);
+        bool is_font = (x11_client_find_font(c, font_xid) != NULL);
+        bool is_gc   = (x11_client_find_gc(c, font_xid) != NULL);
+        if (!is_font && !is_gc) {
+            x11_client_send_error(c, X11_ERR_FONT, font_xid, opcode, 0u);
+            break;
+        }
+        uint8_t reply[60];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 1u;  /* reply indicator */
+        /* byte 1 unused */
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        x11_put_u32(reply + 4, 13u, c->byte_order);  /* reply length */
+        /* bytes 8..59: min-bounds, max-bounds, min/max char, n-props,
+         * draw-direction, byte1 fields, all-chars-exist, ascent,
+         * descent, char-infos-count. All zeroed by memset. */
+        xc_log("info", "QueryFont: font=0x%x -> 60-byte zeroed reply",
+               (unsigned)font_xid);
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_QUERY_TEXT_EXTENTS: {  /* 48 */
+        /* QueryTextExtents payload (after the 4-byte header):
+         *   1 odd-length (header byte 1 = data, BOOL)
+         *   4 fontable (font or gc)
+         *   n*2 bytes of 2-byte chars (the request length encodes n;
+         *   odd-length=1 means the last 2 bytes are pad)
+         * Total = 8 + n*2 bytes (padded so length is even). Reply is
+         * 32 bytes. v1: all metrics zero, draw-direction = 0
+         * (LeftToRight). BadFont if the fontable is not tracked. */
+        if (total < 8u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t font_xid = x11_get_u32(buf + 4, c->byte_order);
+        bool is_font = (x11_client_find_font(c, font_xid) != NULL);
+        bool is_gc   = (x11_client_find_gc(c, font_xid) != NULL);
+        if (!is_font && !is_gc) {
+            x11_client_send_error(c, X11_ERR_FONT, font_xid, opcode, 0u);
+            break;
+        }
+        (void)data;  /* odd-length flag; the bridge discards the
+                      * string in v1. */
+        uint8_t reply[32];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 1u;  /* reply indicator */
+        reply[1] = 0u;  /* draw-direction = LeftToRight */
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        x11_put_u32(reply + 4, 0u, c->byte_order);  /* reply length */
+        /* bytes 8..31: font-ascent, font-descent, overall-ascent,
+         * overall-descent, overall-width (INT32), overall-left
+         * (INT32), overall-right (INT32), pad. All zero. */
+        xc_log("info", "QueryTextExtents: font=0x%x -> 32-byte zeroed reply",
+               (unsigned)font_xid);
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_LIST_FONTS: {  /* 49 */
+        /* ListFonts payload (after the 4-byte header):
+         *   2 max-names
+         *   2 pattern-len
+         *   pattern bytes (padded to 4)
+         * Total = 8 + pad4(pattern_len) bytes. Reply: 32 bytes plus
+         * names data. v1 ships no font database: names_len = 0,
+         * length = 0, total reply = 32 bytes. */
+        if (total < 8u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint16_t max_names   = x11_get_u16(buf + 4, c->byte_order);
+        uint16_t pattern_len = x11_get_u16(buf + 6, c->byte_order);
+        size_t pattern_padded = (size_t)((pattern_len + 3u) & ~3u);
+        if (total < 8u + pattern_padded) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        (void)max_names;
+        uint8_t reply[32];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 1u;  /* reply indicator */
+        /* byte 1 unused */
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        x11_put_u32(reply + 4, 0u, c->byte_order);  /* reply length */
+        x11_put_u16(reply + 8, 0u, c->byte_order);  /* names_len */
+        /* bytes 10..31: pad */
+        xc_log("info",
+               "ListFonts: max-names=%u pattern_len=%u -> 0 names",
+               (unsigned)max_names, (unsigned)pattern_len);
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_LIST_FONTS_WITH_INFO: {  /* 50 */
+        /* ListFontsWithInfo payload is identical to ListFonts. Reply
+         * is a series of font-info replies followed by a terminator
+         * reply with name_len = 0. v1 sends only the terminator (a
+         * 60-byte reply with all metrics zeroed, name_len = 0,
+         * length = 13). */
+        if (total < 8u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint16_t max_names   = x11_get_u16(buf + 4, c->byte_order);
+        uint16_t pattern_len = x11_get_u16(buf + 6, c->byte_order);
+        size_t pattern_padded = (size_t)((pattern_len + 3u) & ~3u);
+        if (total < 8u + pattern_padded) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        (void)max_names;
+        uint8_t reply[60];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 1u;  /* reply indicator */
+        reply[1] = 0u;  /* name_len = 0 (terminator) */
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        x11_put_u32(reply + 4, 13u, c->byte_order);  /* reply length */
+        /* bytes 8..59: min-bounds, max-bounds, min/max char, n-props,
+         * draw-direction, byte1 fields, all-chars-exist, ascent,
+         * descent, replies-hint. All zero. */
+        xc_log("info",
+               "ListFontsWithInfo: max-names=%u pattern_len=%u -> terminator only",
+               (unsigned)max_names, (unsigned)pattern_len);
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_SET_FONT_PATH: {  /* 51 */
+        /* SetFontPath payload (after the 4-byte header):
+         *   2 nfonts
+         *   2 unused
+         *   nfonts strings, each (2 length + length bytes, padded to 4)
+         * No reply. v1: accept and discard. The bridge ships no font
+         * database, so the font path is irrelevant. */
+        if (total < 8u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint16_t nfonts = x11_get_u16(buf + 4, c->byte_order);
+        (void)nfonts;
+        xc_log("info", "SetFontPath: nfonts=%u (accepted, discarded)",
+               (unsigned)nfonts);
+        break;
+    }
+    case X11_REQ_GET_FONT_PATH: {  /* 52 */
+        /* GetFontPath payload: 0 bytes (header only). Reply: 32
+         * bytes; npaths at byte 8. v1 returns npaths = 0. */
+        if (total < 4u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint8_t reply[32];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 1u;  /* reply indicator */
+        /* byte 1 unused */
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        x11_put_u32(reply + 4, 0u, c->byte_order);  /* reply length */
+        x11_put_u16(reply + 8, 0u, c->byte_order);  /* npaths */
+        /* bytes 10..31: pad */
+        xc_log("info", "GetFontPath -> 0 paths");
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_POLY_TEXT_8: {  /* 74 */
+        /* PolyText8 payload (after the 4-byte header):
+         *   4 drawable
+         *   4 gc
+         *   2 x
+         *   2 y
+         *   text items (each: 1 len + 1 delta + len bytes of chars,
+         *   or 255 + 1 delta + 2 font for a TEXTITEM16 marker)
+         * No reply. v1: accept and discard; no text rendering. */
+        if (total < 16u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t draw   = x11_get_u32(buf + 4, c->byte_order);
+        uint32_t gc_xid = x11_get_u32(buf + 8, c->byte_order);
+        if (x11_client_check_drawable(c, draw) == 0) {
+            x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
+            break;
+        }
+        if (x11_client_find_gc(c, gc_xid) == NULL) {
+            x11_client_send_error(c, X11_ERR_GCONTEXT, gc_xid, opcode, 0u);
+            break;
+        }
+        size_t items_bytes = (total > 16u) ? total - 16u : 0u;
+        xc_log("info",
+               "PolyText8: drawable=0x%x gc=0x%x items=%zu bytes (no-op)",
+               (unsigned)draw, (unsigned)gc_xid, items_bytes);
+        break;
+    }
+    case X11_REQ_POLY_TEXT_16: {  /* 75 */
+        /* PolyText16: same layout as PolyText8 but each char is 2
+         * bytes. v1: accept and discard. */
+        if (total < 16u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t draw   = x11_get_u32(buf + 4, c->byte_order);
+        uint32_t gc_xid = x11_get_u32(buf + 8, c->byte_order);
+        if (x11_client_check_drawable(c, draw) == 0) {
+            x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
+            break;
+        }
+        if (x11_client_find_gc(c, gc_xid) == NULL) {
+            x11_client_send_error(c, X11_ERR_GCONTEXT, gc_xid, opcode, 0u);
+            break;
+        }
+        size_t items_bytes = (total > 16u) ? total - 16u : 0u;
+        xc_log("info",
+               "PolyText16: drawable=0x%x gc=0x%x items=%zu bytes (no-op)",
+               (unsigned)draw, (unsigned)gc_xid, items_bytes);
+        break;
+    }
+    case X11_REQ_IMAGE_TEXT_8: {  /* 76 */
+        /* ImageText8 payload (after the 4-byte header):
+         *   1 string-len (header byte 1 = data)
+         *   4 drawable
+         *   4 gc
+         *   2 x
+         *   2 y
+         *   string-len bytes of text (padded to 4)
+         * Total = 16 + pad4(string_len). No reply. v1: accept and
+         * discard. */
+        uint8_t string_len = data;
+        size_t text_padded = (size_t)((string_len + 3u) & ~3u);
+        if (total < 16u + text_padded) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t draw   = x11_get_u32(buf + 4, c->byte_order);
+        uint32_t gc_xid = x11_get_u32(buf + 8, c->byte_order);
+        if (x11_client_check_drawable(c, draw) == 0) {
+            x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
+            break;
+        }
+        if (x11_client_find_gc(c, gc_xid) == NULL) {
+            x11_client_send_error(c, X11_ERR_GCONTEXT, gc_xid, opcode, 0u);
+            break;
+        }
+        xc_log("info",
+               "ImageText8: drawable=0x%x gc=0x%x len=%u (no-op)",
+               (unsigned)draw, (unsigned)gc_xid, (unsigned)string_len);
+        break;
+    }
+    case X11_REQ_IMAGE_TEXT_16: {  /* 77 */
+        /* ImageText16: same layout as ImageText8 but each char is 2
+         * bytes (string-len is in 2-byte units). v1: accept and
+         * discard. */
+        uint8_t string_len = data;  /* in 2-byte units */
+        size_t text_bytes  = (size_t)string_len * 2u;
+        size_t text_padded = (text_bytes + 3u) & ~(size_t)3u;
+        if (total < 16u + text_padded) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t draw   = x11_get_u32(buf + 4, c->byte_order);
+        uint32_t gc_xid = x11_get_u32(buf + 8, c->byte_order);
+        if (x11_client_check_drawable(c, draw) == 0) {
+            x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
+            break;
+        }
+        if (x11_client_find_gc(c, gc_xid) == NULL) {
+            x11_client_send_error(c, X11_ERR_GCONTEXT, gc_xid, opcode, 0u);
+            break;
+        }
+        xc_log("info",
+               "ImageText16: drawable=0x%x gc=0x%x len=%u (no-op)",
+               (unsigned)draw, (unsigned)gc_xid, (unsigned)string_len);
+        break;
+    }
+    case X11_REQ_CREATE_CURSOR: {  /* 93 */
+        /* CreateCursor payload (after the 4-byte header):
+         *   4 cursor (client-allocated XID)
+         *   4 source pixmap
+         *   4 mask pixmap (0 = None)
+         *   2 fore-red, 2 fore-green, 2 fore-blue
+         *   2 back-red, 2 back-green, 2 back-blue
+         *   2 x, 2 y (hotspot)
+         * Total = 28 bytes payload = 32 bytes request (length=8).
+         * No reply. v1 stores the cursor entry; no real cursor
+         * surface is created. BadIDChoice if the XID is already in
+         * use, BadPixmap if the source pixmap is not tracked. The
+         * mask pixmap may be 0 (None) per X11. */
+        if (total < 32u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t cursor_xid = x11_get_u32(buf + 4,  c->byte_order);
+        uint32_t src_pix    = x11_get_u32(buf + 8,  c->byte_order);
+        uint32_t mask_pix   = x11_get_u32(buf + 12, c->byte_order);
+        uint16_t fr         = x11_get_u16(buf + 16, c->byte_order);
+        uint16_t fg         = x11_get_u16(buf + 18, c->byte_order);
+        uint16_t fb         = x11_get_u16(buf + 20, c->byte_order);
+        uint16_t br         = x11_get_u16(buf + 22, c->byte_order);
+        uint16_t bg         = x11_get_u16(buf + 24, c->byte_order);
+        uint16_t bb         = x11_get_u16(buf + 26, c->byte_order);
+        uint16_t hx         = x11_get_u16(buf + 28, c->byte_order);
+        uint16_t hy         = x11_get_u16(buf + 30, c->byte_order);
+        if (x11_client_find_cursor(c, cursor_xid) != NULL) {
+            x11_client_send_error(c, X11_ERR_IDCHOICE, cursor_xid,
+                                  opcode, 0u);
+            break;
+        }
+        if (x11_client_find_pixmap(c, src_pix) == NULL) {
+            x11_client_send_error(c, X11_ERR_PIXMAP, src_pix, opcode, 0u);
+            break;
+        }
+        if (mask_pix != 0u &&
+            x11_client_find_pixmap(c, mask_pix) == NULL) {
+            x11_client_send_error(c, X11_ERR_PIXMAP, mask_pix, opcode, 0u);
+            break;
+        }
+        struct x11_cursor *cu = x11_client_alloc_cursor(c, cursor_xid);
+        if (cu == NULL) {
+            x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+            break;
+        }
+        cu->is_glyph      = false;
+        cu->source_pixmap = src_pix;
+        cu->mask_pixmap   = mask_pix;
+        cu->fore_red = fr; cu->fore_green = fg; cu->fore_blue = fb;
+        cu->back_red = br; cu->back_green = bg; cu->back_blue = bb;
+        cu->hotspot_x = hx;
+        cu->hotspot_y = hy;
+        xc_log("info",
+               "CreateCursor: cursor=0x%x src=0x%x mask=0x%x hotspot=(%u,%u)",
+               (unsigned)cursor_xid, (unsigned)src_pix, (unsigned)mask_pix,
+               (unsigned)hx, (unsigned)hy);
+        break;
+    }
+    case X11_REQ_CREATE_GLYPH_CURSOR: {  /* 94 */
+        /* CreateGlyphCursor payload (after the 4-byte header):
+         *   4 cursor (client-allocated XID)
+         *   4 source font
+         *   4 mask font (0 = None)
+         *   2 source-char, 2 mask-char
+         *   2 fore-red, 2 fore-green, 2 fore-blue
+         *   2 back-red, 2 back-green, 2 back-blue
+         * Total = 28 bytes payload = 32 bytes request (length=8).
+         * No reply. v1 stores the cursor entry. BadIDChoice if the
+         * XID is already in use, BadFont if the source font is not
+         * tracked. The mask font may be 0 (None) per X11. */
+        if (total < 32u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t cursor_xid = x11_get_u32(buf + 4,  c->byte_order);
+        uint32_t src_font   = x11_get_u32(buf + 8,  c->byte_order);
+        uint32_t mask_font  = x11_get_u32(buf + 12, c->byte_order);
+        uint16_t src_char   = x11_get_u16(buf + 16, c->byte_order);
+        uint16_t mask_char  = x11_get_u16(buf + 18, c->byte_order);
+        uint16_t fr         = x11_get_u16(buf + 20, c->byte_order);
+        uint16_t fg         = x11_get_u16(buf + 22, c->byte_order);
+        uint16_t fb         = x11_get_u16(buf + 24, c->byte_order);
+        uint16_t br         = x11_get_u16(buf + 26, c->byte_order);
+        uint16_t bg         = x11_get_u16(buf + 28, c->byte_order);
+        uint16_t bb         = x11_get_u16(buf + 30, c->byte_order);
+        if (x11_client_find_cursor(c, cursor_xid) != NULL) {
+            x11_client_send_error(c, X11_ERR_IDCHOICE, cursor_xid,
+                                  opcode, 0u);
+            break;
+        }
+        if (x11_client_find_font(c, src_font) == NULL) {
+            x11_client_send_error(c, X11_ERR_FONT, src_font, opcode, 0u);
+            break;
+        }
+        if (mask_font != 0u &&
+            x11_client_find_font(c, mask_font) == NULL) {
+            x11_client_send_error(c, X11_ERR_FONT, mask_font, opcode, 0u);
+            break;
+        }
+        struct x11_cursor *cu = x11_client_alloc_cursor(c, cursor_xid);
+        if (cu == NULL) {
+            x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+            break;
+        }
+        cu->is_glyph    = true;
+        cu->source_font = src_font;
+        cu->mask_font   = mask_font;
+        cu->source_char = src_char;
+        cu->mask_char   = mask_char;
+        cu->fore_red = fr; cu->fore_green = fg; cu->fore_blue = fb;
+        cu->back_red = br; cu->back_green = bg; cu->back_blue = bb;
+        xc_log("info",
+               "CreateGlyphCursor: cursor=0x%x src-font=0x%x mask-font=0x%x "
+               "chars=(%u,%u)",
+               (unsigned)cursor_xid, (unsigned)src_font,
+               (unsigned)mask_font, (unsigned)src_char,
+               (unsigned)mask_char);
+        break;
+    }
+    case X11_REQ_FREE_CURSOR: {  /* 95 */
+        /* FreeCursor payload: 4 cursor. Total 8 bytes. No reply.
+         * Marks the cursor slot free. BadCursor if the XID is not
+         * tracked. */
+        if (total < 8u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t cursor_xid = x11_get_u32(buf + 4, c->byte_order);
+        struct x11_cursor *cu = x11_client_find_cursor(c, cursor_xid);
+        if (cu == NULL) {
+            x11_client_send_error(c, X11_ERR_CURSOR, cursor_xid,
+                                  opcode, 0u);
+            break;
+        }
+        cu->in_use = false;
+        xc_log("info", "FreeCursor: cursor=0x%x", (unsigned)cursor_xid);
+        break;
+    }
+    case X11_REQ_RECOLOR_CURSOR: {  /* 96 */
+        /* RecolorCursor payload (after the 4-byte header):
+         *   4 cursor
+         *   2 fore-red, 2 fore-green, 2 fore-blue
+         *   2 back-red, 2 back-green, 2 back-blue
+         * Total = 16 bytes payload = 20 bytes request (length=5).
+         * No reply. Updates the cursor's colors in place. BadCursor
+         * if the XID is not tracked. */
+        if (total < 20u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t cursor_xid = x11_get_u32(buf + 4,  c->byte_order);
+        uint16_t fr         = x11_get_u16(buf + 8,  c->byte_order);
+        uint16_t fg         = x11_get_u16(buf + 10, c->byte_order);
+        uint16_t fb         = x11_get_u16(buf + 12, c->byte_order);
+        uint16_t br         = x11_get_u16(buf + 14, c->byte_order);
+        uint16_t bg         = x11_get_u16(buf + 16, c->byte_order);
+        uint16_t bb         = x11_get_u16(buf + 18, c->byte_order);
+        struct x11_cursor *cu = x11_client_find_cursor(c, cursor_xid);
+        if (cu == NULL) {
+            x11_client_send_error(c, X11_ERR_CURSOR, cursor_xid,
+                                  opcode, 0u);
+            break;
+        }
+        cu->fore_red = fr; cu->fore_green = fg; cu->fore_blue = fb;
+        cu->back_red = br; cu->back_green = bg; cu->back_blue = bb;
+        xc_log("info",
+               "RecolorCursor: cursor=0x%x fore=(%u,%u,%u) back=(%u,%u,%u)",
+               (unsigned)cursor_xid,
+               (unsigned)fr, (unsigned)fg, (unsigned)fb,
+               (unsigned)br, (unsigned)bg, (unsigned)bb);
+        break;
+    }
+    case X11_REQ_QUERY_BEST_SIZE: {  /* 97 */
+        /* QueryBestSize payload (after the 4-byte header):
+         *   1 class (header byte 1 = data: 0 Cursor, 1 Tile, 2 Stipple)
+         *   4 drawable
+         *   2 width
+         *   2 height
+         * Total = 8 bytes payload = 12 bytes request (length=3).
+         * Reply is 16 bytes. v1: the bridge has no hardware cursor /
+         * tile / stipple size limits, so it echoes back the requested
+         * width and height. The drawable is validated to be root, a
+         * tracked window, or a tracked pixmap; an unknown XID is a
+         * BadDrawable error. */
+        uint8_t cls = data;
+        if (cls > 2u) {
+            x11_client_send_error(c, X11_ERR_VALUE, (uint32_t)cls,
+                                  opcode, 0u);
+            break;
+        }
+        if (total < 12u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t draw = x11_get_u32(buf + 4, c->byte_order);
+        uint16_t w    = x11_get_u16(buf + 8, c->byte_order);
+        uint16_t h    = x11_get_u16(buf + 10, c->byte_order);
+        if (x11_client_check_drawable(c, draw) == 0) {
+            x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
+            break;
+        }
+        uint8_t reply[16];
+        x11_build_query_best_size_reply(reply, w, h, seq, c->byte_order);
+        xc_log("info",
+               "QueryBestSize: class=%u drawable=0x%x -> %ux%u",
+               (unsigned)cls, (unsigned)draw, (unsigned)w, (unsigned)h);
         if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
             return -1;
         }

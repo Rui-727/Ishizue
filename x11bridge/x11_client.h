@@ -25,11 +25,31 @@
  * echoes the requested RGB and returns a packed pixel, QueryColors
  * unpacks each pixel as 0x00RRGGBB, and LookupColor returns black.
  *
+ * W11-A: twelve font and text opcodes added (OpenFont, CloseFont,
+ * QueryFont, QueryTextExtents, ListFonts, ListFontsWithInfo,
+ * SetFontPath, GetFontPath, PolyText8, PolyText16, ImageText8,
+ * ImageText16). Per-client state gained a font table. The bridge ships
+ * no font database: OpenFont stores the name only, QueryFont and
+ * QueryTextExtents return all-zero metrics, ListFonts returns an empty
+ * list, ListFontsWithInfo sends only the terminator reply, GetFontPath
+ * returns npaths=0, and SetFontPath / PolyText* / ImageText* accept
+ * and discard their payloads. BadFont is sent when QueryFont /
+ * QueryTextExtents target a font XID the bridge does not track.
+ *
  * W10-A: five rendering opcodes added (FreeGC, ClearArea, CopyArea,
  * PolyFillRectangle, GetImage). Per-window state gained a
  * background_pixel field so ClearArea can paint with it. GetImage
  * reads back from the PutImage backing store; CopyArea and
- * PolyFillRectangle no-op the pixel copy in v1. */
+ * PolyFillRectangle no-op the pixel copy in v1.
+ *
+ * W11-B: five cursor / misc opcodes added (CreateCursor,
+ * CreateGlyphCursor, FreeCursor, RecolorCursor, QueryBestSize).
+ * Per-client state gained a cursor table. The bridge does no real
+ * cursor rendering; CreateCursor / CreateGlyphCursor store the
+ * source (pixmap or font) and colors so RecolorCursor can update
+ * them and FreeCursor can release the slot. QueryBestSize echoes
+ * back the requested width and height unchanged because the bridge
+ * has no hardware cursor / tile / stipple size limits. */
 
 #ifndef X11_CLIENT_H
 #define X11_CLIENT_H
@@ -48,6 +68,9 @@
 #define X11_CLIENT_MAX_GCS    32   /* graphics contexts per client */
 #define X11_CLIENT_MAX_SELS   8    /* selection ownerships per client */
 #define X11_CLIENT_MAX_CMAPS  16   /* colormaps tracked per client */
+#define X11_CLIENT_MAX_FONTS  16   /* fonts tracked per client */
+#define X11_CLIENT_MAX_CURSORS 16  /* cursors tracked per client */
+#define X11_FONT_NAME_MAX     256  /* per-font name buffer */
 #define X11_PUT_IMAGE_MAX_BYTES  (64u * 1024u)  /* per-PutImage data cap */
 
 /* Per-window property: (property atom, type atom, format, value bytes).
@@ -177,6 +200,45 @@ struct x11_colormap {
     uint8_t   alloc_flag;     /* X11_ALLOC_NONE or X11_ALLOC_ALL */
 };
 
+/* W11-A: per-client font. Created by OpenFont (45). The bridge does no
+ * real font loading and no text rendering in v1; the name is tracked so
+ * QueryFont / ListFonts can validate the font XID. CloseFont marks the
+ * slot free. PolyText8/16 and ImageText8/16 accept and discard their
+ * payloads. name is NUL-terminated; name_len is the byte count without
+ * the terminator. */
+struct x11_font {
+    bool      in_use;
+    uint32_t  font_xid;            /* client-allocated XID */
+    size_t    name_len;            /* bytes in name (no terminator) */
+    char      name[X11_FONT_NAME_MAX];
+};
+
+/* W11-B: per-client cursor. Created by CreateCursor (93) or
+ * CreateGlyphCursor (94). The bridge does no real cursor rendering in
+ * v1; the cursor entry exists so RecolorCursor can update the colors
+ * and FreeCursor can release the slot. is_glyph distinguishes the two
+ * sources: when false, source_pixmap / mask_pixmap hold the source
+ * pixmaps (mask_pixmap may be 0 = None per X11); when true,
+ * source_font / mask_font hold the font XIDs (mask_font may be 0) and
+ * source_char / mask_char hold the glyph indices. fore_rgb / back_rgb
+ * are the cursor colors; hotspot_x / hotspot_y are the cursor hotspot
+ * (only meaningful for pixmap cursors; glyph cursors inherit the
+ * glyph origin). */
+struct x11_cursor {
+    bool      in_use;
+    uint32_t  cursor_xid;          /* client-allocated XID */
+    bool      is_glyph;            /* false = pixmap source, true = font source */
+    uint32_t  source_pixmap;       /* CreateCursor source pixmap */
+    uint32_t  mask_pixmap;         /* CreateCursor mask pixmap (0 = None) */
+    uint32_t  source_font;         /* CreateGlyphCursor source font */
+    uint32_t  mask_font;           /* CreateGlyphCursor mask font (0 = None) */
+    uint16_t  source_char;         /* CreateGlyphCursor source glyph */
+    uint16_t  mask_char;           /* CreateGlyphCursor mask glyph */
+    uint16_t  fore_red, fore_green, fore_blue;
+    uint16_t  back_red, back_green, back_blue;
+    uint16_t  hotspot_x, hotspot_y;
+};
+
 struct x11_client {
     int      fd;
     bool     setup_done;          /* setup_request received, success sent */
@@ -221,6 +283,20 @@ struct x11_client {
      * validate the colormap XID and reject unknown ones with
      * BadColormap. */
     struct x11_colormap colormaps[X11_CLIENT_MAX_CMAPS];
+
+    /* W11-A: font table. Keyed by client-allocated font XID. The
+     * bridge ships no font database; OpenFont stores the name only so
+     * QueryFont / QueryTextExtents can validate the font XID. Text
+     * drawing opcodes (PolyText8/16, ImageText8/16) accept and discard
+     * their payloads. */
+    struct x11_font fonts[X11_CLIENT_MAX_FONTS];
+
+    /* W11-B: cursor table. Keyed by client-allocated cursor XID. The
+     * bridge does no real cursor rendering; the table exists so
+     * RecolorCursor can update the colors and FreeCursor can release
+     * the slot. CreateCursor stores pixmap source, CreateGlyphCursor
+     * stores font source. */
+    struct x11_cursor cursors[X11_CLIENT_MAX_CURSORS];
 
     /* W9-B: keyboard focus state, set by SetInputFocus (42). The
      * bridge translates focus to ISZ_MSG_SEAT_SET_KEYBOARD_FOCUS.

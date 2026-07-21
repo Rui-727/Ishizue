@@ -62,6 +62,11 @@
  * W10-A adds five rendering opcodes: FreeGC, ClearArea, CopyArea,
  * PolyFillRectangle, GetImage. W10-B adds five colormap opcodes:
  * CreateColormap, FreeColormap, AllocColor, QueryColors, LookupColor.
+ * W11-A adds twelve font and text opcodes: OpenFont, CloseFont,
+ * QueryFont, QueryTextExtents, ListFonts, ListFontsWithInfo,
+ * SetFontPath, GetFontPath, PolyText8, PolyText16, ImageText8,
+ * ImageText16. W11-B adds five cursor / misc opcodes: CreateCursor,
+ * CreateGlyphCursor, FreeCursor, RecolorCursor, QueryBestSize.
  * Other opcodes the scaffold must accept (QueryExtension,
  * GetInputFocus, ...) stay in the no-op default branch; see
  * x11_client.c. */
@@ -85,6 +90,14 @@ enum x11_request {
     X11_REQ_QUERY_POINTER        = 38,
     X11_REQ_SET_INPUT_FOCUS      = 42,
     X11_REQ_GET_INPUT_FOCUS      = 43,
+    X11_REQ_OPEN_FONT            = 45,
+    X11_REQ_CLOSE_FONT           = 46,
+    X11_REQ_QUERY_FONT           = 47,
+    X11_REQ_QUERY_TEXT_EXTENTS   = 48,
+    X11_REQ_LIST_FONTS           = 49,
+    X11_REQ_LIST_FONTS_WITH_INFO = 50,
+    X11_REQ_SET_FONT_PATH        = 51,
+    X11_REQ_GET_FONT_PATH        = 52,
     X11_REQ_CREATE_GC            = 55,
     X11_REQ_FREE_GC              = 60,
     X11_REQ_CLEAR_AREA           = 61,
@@ -92,13 +105,29 @@ enum x11_request {
     X11_REQ_POLY_FILL_RECTANGLE  = 69,
     X11_REQ_PUT_IMAGE            = 72,
     X11_REQ_GET_IMAGE            = 73,
+    X11_REQ_POLY_TEXT_8          = 74,
+    X11_REQ_POLY_TEXT_16         = 75,
+    X11_REQ_IMAGE_TEXT_8         = 76,
+    X11_REQ_IMAGE_TEXT_16        = 77,
     X11_REQ_CREATE_COLORMAP      = 78,
     X11_REQ_FREE_COLORMAP        = 79,
     X11_REQ_ALLOC_COLOR          = 84,
     X11_REQ_QUERY_COLORS         = 91,
     X11_REQ_LOOKUP_COLOR         = 92,
+    X11_REQ_CREATE_CURSOR        = 93,
+    X11_REQ_CREATE_GLYPH_CURSOR  = 94,
+    X11_REQ_FREE_CURSOR          = 95,
+    X11_REQ_RECOLOR_CURSOR       = 96,
+    X11_REQ_QUERY_BEST_SIZE      = 97,
     X11_REQ_QUERY_EXTENSION      = 98,
 };
+
+/* QueryBestSize class values (header byte 1 of the request). The
+ * bridge has no hardware cursor / tile / stipple size limits, so
+ * QueryBestSize always echoes back the requested width and height. */
+#define X11_QUERY_BEST_SIZE_CURSOR   0u
+#define X11_QUERY_BEST_SIZE_TILE     1u
+#define X11_QUERY_BEST_SIZE_STIPPLE  2u
 
 /* CreateColormap alloc values (header byte 1). */
 #define X11_ALLOC_NONE  0u
@@ -629,5 +658,20 @@ size_t   x11_build_expose(uint8_t *out_buf,
                           uint16_t width, uint16_t height,
                           uint16_t count,
                           uint16_t sequence, uint8_t byte_order);
+
+/* Build a 16-byte QueryBestSize reply. Reply layout:
+ *   byte 0:    1 (reply indicator)
+ *   byte 1:    pad
+ *   bytes 2-3: CARD16 sequence
+ *   bytes 4-7: CARD32 reply length (always 0)
+ *   bytes 8-9:    CARD16 width  (best or requested)
+ *   bytes 10-11:  CARD16 height (best or requested)
+ *   bytes 12-15:  pad
+ * v1: the bridge has no hardware cursor / tile / stipple size limits
+ * to query, so it echoes back the requested width and height. */
+size_t   x11_build_query_best_size_reply(uint8_t *out_buf,
+                                         uint16_t width, uint16_t height,
+                                         uint16_t sequence,
+                                         uint8_t byte_order);
 
 #endif /* X11_PROTO_H */

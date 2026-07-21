@@ -704,3 +704,22 @@ size_t x11_build_expose(uint8_t *out_buf,
     x11_put_u16(out_buf + 16, count, byte_order);
     return 32;
 }
+
+/* QueryBestSize reply (16 bytes). Reply length is 0 (no additional
+ * data). The bridge has no hardware cursor / tile / stipple size
+ * limits, so it echoes back the requested width and height. */
+size_t x11_build_query_best_size_reply(uint8_t *out_buf,
+                                       uint16_t width, uint16_t height,
+                                       uint16_t sequence,
+                                       uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 16);
+    out_buf[0] = 1u;  /* reply indicator */
+    /* byte 1: pad */
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, 0u, byte_order);  /* reply length */
+    x11_put_u16(out_buf + 8,  width,  byte_order);
+    x11_put_u16(out_buf + 10, height, byte_order);
+    /* bytes 12..15: pad */
+    return 16;
+}

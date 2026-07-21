@@ -53,9 +53,13 @@ TEST4_BIN := tests/test_x11_colormap
 TEST4_SRC := tests/test_x11_colormap.c
 TEST5_BIN := tests/test_x11_render
 TEST5_SRC := tests/test_x11_render.c
+TEST6_BIN := tests/test_x11_fonts
+TEST6_SRC := tests/test_x11_fonts.c
+TEST7_BIN := tests/test_x11_cursor
+TEST7_SRC := tests/test_x11_cursor.c
 
 .PHONY: all clean test
-all: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN)
+all: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN) $(TEST6_BIN) $(TEST7_BIN)
 
 $(BIN): $(OBJS)
 	@if [ ! -f ../libishizue.so ] && [ "$(BRIDGE_LDLIBS)" = "-L.. -lishizue" ]; then \
@@ -117,9 +121,31 @@ $(TEST5_BIN): $(TEST5_SRC)
 	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
 		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
 
+# W11-A integration test: exercises OpenFont, CloseFont, QueryFont,
+# QueryTextExtents, ListFonts, ListFontsWithInfo, SetFontPath,
+# GetFontPath, PolyText8, ImageText8 on the headless backend. Verifies
+# that QueryFont / QueryTextExtents / ListFontsWithInfo return
+# zeroed-metrics replies, ListFonts / GetFontPath return empty lists,
+# and CloseFont on an unknown XID is a silent no-op.
+$(TEST6_BIN): $(TEST6_SRC)
+	@mkdir -p tests
+	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
+		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+
+# W11-B integration test: exercises CreatePixmap (for cursor source),
+# CreateCursor, RecolorCursor, QueryBestSize, FreeCursor (twice for
+# BadCursor), and CreateGlyphCursor (with OpenFont first) on the
+# headless backend. Verifies that QueryBestSize echoes the requested
+# 16x16 size and that FreeCursor on an already-freed cursor returns
+# BadCursor.
+$(TEST7_BIN): $(TEST7_SRC)
+	@mkdir -p tests
+	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
+		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+
 # Build + run the integration tests. Runs from the repo root so the
 # default bridge binary path (x11bridge/x11bridge) resolves.
-test: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN)
+test: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN) $(TEST6_BIN) $(TEST7_BIN)
 	@cd .. && \
 		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
 		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
@@ -140,6 +166,14 @@ test: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN)
 		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
 		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
 		./x11bridge/tests/test_x11_render
+	@cd .. && \
+		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+		./x11bridge/tests/test_x11_fonts
+	@cd .. && \
+		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+		./x11bridge/tests/test_x11_cursor
 
 clean:
-	rm -rf $(BUILD_DIR) $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN)
+	rm -rf $(BUILD_DIR) $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN) $(TEST6_BIN) $(TEST7_BIN)

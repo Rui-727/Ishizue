@@ -161,6 +161,14 @@ test check:
 	@ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
 	    LD_LIBRARY_PATH=$$(pwd)/$(TEST_BUILD_DIR):$$LD_LIBRARY_PATH \
 	    ./x11bridge/tests/test_x11_render
+	@echo "--- running test_x11_fonts ---"
+	@ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+	    LD_LIBRARY_PATH=$$(pwd)/$(TEST_BUILD_DIR):$$LD_LIBRARY_PATH \
+	    ./x11bridge/tests/test_x11_fonts
+	@echo "--- running test_x11_cursor ---"
+	@ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+	    LD_LIBRARY_PATH=$$(pwd)/$(TEST_BUILD_DIR):$$LD_LIBRARY_PATH \
+	    ./x11bridge/tests/test_x11_cursor
 	@rm -rf $(TEST_BUILD_DIR)
 
 install: all
