@@ -22,3 +22,4 @@ x11bridge/x11bridge
 tools/isz_compositor
 tinyisz/tinyisz
 tinyisz/*.o
+*.deb
