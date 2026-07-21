@@ -39,6 +39,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef ISHIZUE_HAVE_DRM
+#include <drm_mode.h>
+#include <xf86drmMode.h>
+#endif
+
 #include "isz_backend.h"
 #include "../util/isz_list.h"
 
@@ -73,6 +78,11 @@ struct isz_drm_connector {
     uint32_t refresh_mhz;
     bool     hdr_capable;
     bool     vrr_capable;
+    /* Full KMS mode for the first connector mode. The atomic commit
+     * path needs the real clock + hsync/vsync/htotal/vtotal timing.
+     * Fabricating these from width/height/refresh makes the kernel
+     * reject the modeset with EINVAL. */
+    drmModeModeInfo mode;
 };
 
 struct isz_drm_crtc {

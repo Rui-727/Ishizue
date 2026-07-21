@@ -63,6 +63,9 @@
 #include "util/isz_list.h"
 #include "backend/isz_backend.h"
 #include "backend/isz_headless.h"
+#ifdef ISHIZUE_HAVE_DRM
+#include "backend/isz_drm.h"
+#endif
 #include "buffer/isz_buffer.h"
 #include "buffer/isz_psi.h"
 #include "input/isz_seat_internal.h"
@@ -214,6 +217,11 @@ struct isz_output {
     bool                 vrr_capable;
     bool                 vrr_enabled;
     char                 gpu_node_path[64];  /* render node for scanout */
+#ifdef ISHIZUE_HAVE_DRM
+    drmModeModeInfo      drm_mode;  /* full KMS mode for atomic commit */
+    uint32_t             drm_black_fb_id;  /* dumb buffer FB for modeset-on-enable */
+    uint32_t             drm_black_handle; /* GEM handle for the dumb buffer */
+#endif
 
     /* Modes (EDID-derived for DRM; synthetic for headless). Stored as
      * an array of pointers so isz_output_get_modes can hand back the

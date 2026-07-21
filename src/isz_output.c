@@ -311,6 +311,7 @@ int isz_server_wrap_drm_output(isz_server *srv,
     out->drm_crtc_id      = conn->crtc_id;
     out->drm_crtc_mask    = conn->crtc_mask;
     out->is_drm           = true;
+    out->drm_mode         = conn->mode;  /* full KMS mode for atomic commit */
     out->dpms             = ISZ_DPMS_OFF;
     out->enabled          = false;
     out->hdr_capable      = conn->hdr_capable;

@@ -241,6 +241,11 @@ static void snapshot_connector(int drm_fd, drmModeConnector *conn,
         out->width       = m->hdisplay;
         out->height      = m->vdisplay;
         out->refresh_mhz = m->vrefresh ? m->vrefresh * 1000u : 60000u;
+        /* Store the full mode for the atomic commit path. The kernel
+         * needs the real clock + hsync/vsync/htotal/vtotal; fabricating
+         * them from width/height/refresh makes drmModeAtomicCommit
+         * return EINVAL. */
+        out->mode = *m;
     }
 
     /* EDID + HDR + VRR. */

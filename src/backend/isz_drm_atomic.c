@@ -47,12 +47,15 @@
 
 #include <drm.h>
 #include <drm_mode.h>
+#include <drm_fourcc.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <sys/mman.h>
 
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 /* ------------------------------------------------------------------ */
 /* Property id lookup                                                 */
@@ -260,17 +263,18 @@ int isz_drm_atomic_commit(struct isz_drm_state *st,
         goto out;
     }
 
-    /* Serialize the mode into a KMS blob and set CRTC_MODE_ID + ACTIVE. */
-    mode.clock       = out->current_mode->refresh_mhz ?
-                       out->current_mode->refresh_mhz / 1000u : 60000;
-    mode.hdisplay    = out->current_mode->width;
-    mode.vdisplay    = out->current_mode->height;
-    mode.hsync_start = out->current_mode->width;
-    mode.hsync_end   = out->current_mode->width;
-    mode.htotal      = out->current_mode->width;
-    mode.vsync_start = out->current_mode->height;
-    mode.vsync_end   = out->current_mode->height;
-    mode.vtotal      = out->current_mode->height;
+    /* Serialize the mode into a KMS blob and set CRTC_MODE_ID + ACTIVE.
+     * Use the full drmModeModeInfo stored on the output (real clock +
+     * hsync/vsync/htotal/vtotal). The old code fabricated these from
+     * width/height/refresh, which made the kernel reject the modeset
+     * with EINVAL (zero blanking, wrong pixel clock). */
+    if (out->drm_mode.clock == 0) {
+        isz_log_internal(ISZ_LOG_ERROR,
+                         "drm atomic: output has no real KMS mode (clock=0)");
+        rc = ISZ_ERR_INVALID_ARG;
+        goto out;
+    }
+    mode = out->drm_mode;
 
     if (drmModeCreatePropertyBlob(st->drm_fd, &mode, sizeof(mode),
                                   &blob_mode_id) != 0) {
@@ -456,6 +460,81 @@ int isz_drm_atomic_commit(struct isz_drm_state *st,
                                  "drm atomic: drmModeAddFB2 failed");
             }
         }
+    } else {
+        /* No surface mapped on this output. Allocate a black dumb
+         * buffer so the primary plane has a valid FB to scan out during
+         * the modeset. Without this the kernel rejects the commit
+         * because the primary plane has FB_ID=0 while ACTIVE=1. The
+         * buffer is cached on the output (drm_black_fb_id) so we only
+         * allocate once; subsequent commits reuse it until a real
+         * surface arrives. */
+        if (out->drm_black_fb_id == 0) {
+            uint32_t black_handle = 0;
+            uint32_t black_pitch  = 0;
+            uint64_t black_size   = 0;
+            if (drmModeCreateDumbBuffer(st->drm_fd,
+                                        out->drm_mode.hdisplay,
+                                        out->drm_mode.vdisplay,
+                                        32, 0,
+                                        &black_handle, &black_pitch,
+                                        &black_size) == 0) {
+                uint32_t black_fb = 0;
+                uint32_t black_handles[4] = {0};
+                uint32_t black_pitches[4] = {0};
+                uint32_t black_offsets[4] = {0};
+                black_handles[0] = black_handle;
+                black_pitches[0] = black_pitch;
+                if (drmModeAddFB2(st->drm_fd, out->drm_mode.hdisplay,
+                                  out->drm_mode.vdisplay,
+                                  DRM_FORMAT_XRGB8888,
+                                  black_handles, black_pitches,
+                                  black_offsets, &black_fb, 0) == 0) {
+                    out->drm_black_fb_id    = black_fb;
+                    out->drm_black_handle   = black_handle;
+                    /* mmap and zero the buffer so the screen is black. */
+                    struct drm_mode_map_dumb mreq = {0};
+                    mreq.handle = black_handle;
+                    if (drmIoctl(st->drm_fd, DRM_IOCTL_MODE_MAP_DUMB,
+                                 &mreq) == 0) {
+                        void *map = mmap(NULL, black_size, PROT_WRITE,
+                                         MAP_SHARED, st->drm_fd,
+                                         mreq.offset);
+                        if (map != MAP_FAILED) {
+                            memset(map, 0, black_size);
+                            munmap(map, black_size);
+                        }
+                    }
+                } else {
+                    drmModeDestroyDumbBuffer(st->drm_fd, black_handle);
+                }
+            }
+        }
+        if (out->drm_black_fb_id != 0) {
+            (void)add_prop(req, primary_plane_id, cache->plane_fb_id,
+                           out->drm_black_fb_id, "FB_ID", true);
+            (void)add_prop(req, primary_plane_id, cache->plane_crtc_id,
+                           crtc_id, "CRTC_ID", true);
+            (void)drmModeAtomicAddProperty(req, primary_plane_id,
+                                           cache->plane_src_x, 0);
+            (void)drmModeAtomicAddProperty(req, primary_plane_id,
+                                           cache->plane_src_y, 0);
+            (void)drmModeAtomicAddProperty(req, primary_plane_id,
+                                           cache->plane_src_w,
+                                           (uint64_t)out->drm_mode.hdisplay << 16);
+            (void)drmModeAtomicAddProperty(req, primary_plane_id,
+                                           cache->plane_src_h,
+                                           (uint64_t)out->drm_mode.vdisplay << 16);
+            (void)drmModeAtomicAddProperty(req, primary_plane_id,
+                                           cache->plane_crtc_x, 0);
+            (void)drmModeAtomicAddProperty(req, primary_plane_id,
+                                           cache->plane_crtc_y, 0);
+            (void)drmModeAtomicAddProperty(req, primary_plane_id,
+                                           cache->plane_crtc_w,
+                                           out->drm_mode.hdisplay);
+            (void)drmModeAtomicAddProperty(req, primary_plane_id,
+                                           cache->plane_crtc_h,
+                                           out->drm_mode.vdisplay);
+        }
     }
 
     /* W5-B: request an out-fence from the CRTC. The kernel writes a
@@ -486,11 +565,18 @@ int isz_drm_atomic_commit(struct isz_drm_state *st,
     /* Commit flags. NONBLOCK so the call returns immediately and the
      * page-flip event signals completion via read_events (SPEC 7.3).
      * TEST_ONLY adds TEST_ONLY and skips the page-flip event. ASYNC
-     * adds PAGE_FLIP_ASYNC (SPEC 7.3). */
+     * adds PAGE_FLIP_ASYNC (SPEC 7.3).
+     *
+     * ALLOW_MODESET is required on the first commit after enable
+     * because it sets ACTIVE, MODE_ID, and connector CRTC_ID (all
+     * topology-changing). Without it the kernel returns EINVAL
+     * (rc=-22). Also required when the mode changes or the CRTC is
+     * being disabled. For v1 we set it on every commit that touches
+     * the mode blob; the kernel ignores it on page-flip-only commits. */
     commit_flags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
+    commit_flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
     if (flags & ISZ_COMMIT_TEST_ONLY) {
-        commit_flags = DRM_MODE_ATOMIC_TEST_ONLY;
-        /* Test commits are synchronous; no page-flip event. */
+        commit_flags = DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET;
     }
     if (flags & ISZ_COMMIT_ASYNC) {
         commit_flags |= DRM_MODE_PAGE_FLIP_ASYNC;
@@ -499,7 +585,8 @@ int isz_drm_atomic_commit(struct isz_drm_state *st,
     ret = drmModeAtomicCommit(st->drm_fd, req, commit_flags, st);
     if (ret != 0) {
         isz_log_internal(ISZ_LOG_ERROR,
-                         "drm atomic: commit failed rc=%d", ret);
+                         "drm atomic: commit failed rc=%d errno=%d (%s)",
+                         ret, errno, strerror(errno));
         rc = ISZ_ERR_COMMIT_FAILED;
         goto out;
     }
