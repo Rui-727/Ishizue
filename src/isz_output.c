@@ -49,6 +49,9 @@
 #include "util/isz_log.h"
 #include "backend/isz_backend.h"
 #include "backend/isz_headless.h"
+#ifdef ISHIZUE_HAVE_DRM
+#include "backend/isz_drm.h"
+#endif
 
 /* DRM_FORMAT_XRGB8888 / ARGB8888 fourccs, written out as literals so
  * this TU doesn't depend on <drm_fourcc.h>. The values are
@@ -277,6 +280,117 @@ void isz_server_unwrap_headless_output(isz_server *srv, uint32_t headless_id)
         }
     }
 }
+
+#ifdef ISHIZUE_HAVE_DRM
+/* Wrap a DRM connector into an isz_output. Mirrors the headless
+ * wrap path but populates drm_connector_id, drm_crtc_id, drm_crtc_mask,
+ * and the EDID blob. The connector's first mode becomes the output's
+ * first mode (more modes can be added later from the full mode list). */
+int isz_server_wrap_drm_output(isz_server *srv,
+                               const struct isz_drm_connector *conn)
+{
+    if (!srv || !conn)
+        return ISZ_ERR_INVALID_ARG;
+
+    /* Dedup: if a wrapper for this connector_id exists, no-op. */
+    isz_list_node *pos;
+    isz_list_for_each(pos, &srv->outputs) {
+        struct isz_output *o = container_of(pos, struct isz_output, node);
+        if (o->is_drm && o->drm_connector_id == conn->connector_id)
+            return ISZ_OK;
+    }
+
+    struct isz_output *out = calloc(1, sizeof(*out));
+    if (!out)
+        return ISZ_ERR_NO_MEMORY;
+
+    out->srv              = srv;
+    out->backend          = srv->backend;
+    out->id               = srv->next_output_id++;
+    out->drm_connector_id = conn->connector_id;
+    out->drm_crtc_id      = conn->crtc_id;
+    out->is_drm           = true;
+    out->dpms             = ISZ_DPMS_OFF;
+    out->enabled          = false;
+    out->hdr_capable      = conn->hdr_capable;
+    out->vrr_capable      = conn->vrr_capable;
+    snprintf(out->name, sizeof(out->name), "%s", conn->name);
+
+    /* Copy EDID if present. */
+    if (conn->edid && conn->edid_size > 0) {
+        out->edid = malloc(conn->edid_size);
+        if (out->edid) {
+            memcpy(out->edid, conn->edid, conn->edid_size);
+            out->edid_size = conn->edid_size;
+        }
+    }
+
+    /* One mode from the connector's first mode. The full mode list
+     * comes from drmModeGetConnector in a later wave; for now the
+     * first mode is enough for tinyisz to call isz_output_enable. */
+    if (conn->connected && conn->width > 0 && conn->height > 0) {
+        out->modes = calloc(1, sizeof(*out->modes));
+        if (!out->modes) {
+            isz_output_destroy_internal(out);
+            free(out);
+            return ISZ_ERR_NO_MEMORY;
+        }
+        out->mode_count = 1;
+        out->modes[0] = calloc(1, sizeof(struct isz_mode));
+        if (!out->modes[0]) {
+            isz_output_destroy_internal(out);
+            free(out);
+            return ISZ_ERR_NO_MEMORY;
+        }
+        out->modes[0]->width       = conn->width;
+        out->modes[0]->height      = conn->height;
+        out->modes[0]->refresh_mhz = conn->refresh_mhz;
+        out->modes[0]->preferred   = true;
+
+        out->mode_ptr_cache = calloc(1, sizeof(*out->mode_ptr_cache));
+        if (!out->mode_ptr_cache) {
+            isz_output_destroy_internal(out);
+            free(out);
+            return ISZ_ERR_NO_MEMORY;
+        }
+        out->mode_ptr_count  = 1;
+        out->mode_ptr_cache[0] = out->modes[0];
+    }
+
+    isz_list_push_back(&srv->outputs, &out->node);
+
+    isz_log_internal(ISZ_LOG_INFO,
+                     "wrapped drm output: connector=%u crtc=%u %ux%u@%u mHz",
+                     (unsigned)conn->connector_id, (unsigned)conn->crtc_id,
+                     (unsigned)conn->width, (unsigned)conn->height,
+                     (unsigned)conn->refresh_mhz);
+
+    /* Broadcast OUTPUT_ADD. */
+    isz_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = ISZ_EVENT_OUTPUT_ADD;
+    isz_server_emit_event(srv, &ev);
+    return ISZ_OK;
+}
+
+void isz_server_unwrap_drm_output(isz_server *srv, uint32_t connector_id)
+{
+    if (!srv)
+        return;
+    isz_list_node *pos;
+    isz_list_for_each(pos, &srv->outputs) {
+        struct isz_output *o = container_of(pos, struct isz_output, node);
+        if (o->is_drm && o->drm_connector_id == connector_id) {
+            o->disconnected = true;
+            isz_event ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.type = ISZ_EVENT_OUTPUT_REMOVE;
+            isz_server_emit_event(srv, &ev);
+            return;
+        }
+    }
+}
+#endif /* ISHIZUE_HAVE_DRM */
 
 /* ------------------------------------------------------------------ */
 /* Public API (isz.h)                                                 */

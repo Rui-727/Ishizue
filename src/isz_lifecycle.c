@@ -100,6 +100,39 @@ static void isz_headless_output_hook(void *userdata,
         isz_server_unwrap_headless_output(srv, info->id);
 }
 
+#ifdef ISHIZUE_HAVE_DRM
+/* DRM output hook: fires for hotplug after isz_init. Initial
+ * connectors are wrapped by isz_init directly via
+ * isz_drm_get_connectors; this hook covers the rescan path. */
+static void isz_drm_output_hook(void *userdata,
+                                const struct isz_drm_output_info *info,
+                                bool added)
+{
+    isz_server *srv = userdata;
+    if (!srv || !info)
+        return;
+    if (srv->state == ISZ_SERVER_DESTROYING)
+        return;
+    /* The DRM hook receives an isz_drm_output_info (snapshot struct),
+     * but isz_server_wrap_drm_output takes an isz_drm_connector
+     * (the persistent struct). Look up the connector by id and wrap
+     * that, so the wrapper has the full mode list + EDID. */
+    if (added) {
+        size_t n = 0;
+        const struct isz_drm_connector *conns =
+            isz_drm_get_connectors(srv->backend, &n);
+        for (size_t i = 0; i < n; i++) {
+            if (conns[i].connector_id == info->connector_id) {
+                isz_server_wrap_drm_output(srv, &conns[i]);
+                break;
+            }
+        }
+    } else {
+        isz_server_unwrap_drm_output(srv, info->connector_id);
+    }
+}
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Cross-wave accessors                                               */
 /* ------------------------------------------------------------------ */
@@ -189,6 +222,18 @@ ISZ_API isz_server *isz_init(enum isz_backend_type backend, void *backend_config
      * isz_backend_read_events. */
     if (backend == ISZ_BACKEND_DRM) {
         isz_drm_set_server(srv->backend, srv);
+        isz_drm_set_output_hook(srv->backend, isz_drm_output_hook, srv);
+        /* Wrap initial connectors that isz_drm_init already enumerated.
+         * The hook fires for hotplugs going forward; this loop covers
+         * the connectors discovered before the hook was registered. */
+        size_t n = 0;
+        const struct isz_drm_connector *conns =
+            isz_drm_get_connectors(srv->backend, &n);
+        for (size_t i = 0; i < n; i++) {
+            if (conns[i].connected) {
+                isz_server_wrap_drm_output(srv, &conns[i]);
+            }
+        }
     }
 #endif
 

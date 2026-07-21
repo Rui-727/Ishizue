@@ -390,6 +390,18 @@ int  isz_server_wrap_headless_output(isz_server *srv,
 void isz_server_unwrap_headless_output(isz_server *srv, uint32_t headless_id)
     ISZ_INTERNAL;
 
+/* Internal: wrap a DRM backend connector into an isz_output, add it
+ * to the server's outputs list, and emit ISZ_EVENT_OUTPUT_ADD. */
+struct isz_drm_connector;
+int  isz_server_wrap_drm_output(isz_server *srv,
+                                const struct isz_drm_connector *conn)
+    ISZ_INTERNAL;
+
+/* Internal: find a DRM-wrapped output by connector_id and emit
+ * ISZ_EVENT_OUTPUT_REMOVE. */
+void isz_server_unwrap_drm_output(isz_server *srv, uint32_t connector_id)
+    ISZ_INTERNAL;
+
 /* W4-A DRM backend internal accessors. These are NOT in isz.h; they
  * exist for the DRM backend wave to set / read DRM-specific output
  * state without touching the public ABI. All hidden (no ISZ_API). */

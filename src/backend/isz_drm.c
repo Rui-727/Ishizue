@@ -875,6 +875,16 @@ int isz_drm_get_vt_fd(struct isz_backend *b)
     return ((struct isz_drm_state *)b->impl)->vt_fd;
 }
 
+const struct isz_drm_connector *isz_drm_get_connectors(struct isz_backend *b,
+                                                       size_t *n)
+{
+    if (!b || !b->impl || !n)
+        return NULL;
+    struct isz_drm_state *st = b->impl;
+    *n = st->connector_count;
+    return st->connectors;
+}
+
 /* Session-active/inactive listener shims. isz_init registers these on
  * the corresponding event types when the DRM backend is selected. The
  * userdata is the struct isz_backend pointer; ev is the SESSION_ACTIVE

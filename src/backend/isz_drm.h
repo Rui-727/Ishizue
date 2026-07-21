@@ -193,6 +193,13 @@ void isz_drm_on_session_active(struct isz_backend *b);
  * fd, or -1 when not running under libseat. */
 int  isz_drm_get_vt_fd(struct isz_backend *b);
 
+/* Return the cached connector snapshots. The pointer is valid until
+ * the next libseat dispatch or backend destroy. Count is written to
+ * *n. Used by isz_init to wrap initial connectors after wiring the
+ * output hook (mirrors isz_headless_outputs). */
+const struct isz_drm_connector *isz_drm_get_connectors(struct isz_backend *b,
+                                                       size_t *n);
+
 /* Hotplug rescan. Re-reads the connector list, fires the output hook
  * for any newly-appeared or disappeared connectors. Exposed here so
  * isz_drm_event.c can drive it from the page-flip / hotplug path. */

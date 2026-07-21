@@ -38,6 +38,26 @@ static void on_signal(int signo)
     else g_exit = 1;
 }
 
+/* Forward isz_log_internal messages to stderr. The level is shown
+ * as a short prefix so the user can see what's an error vs info. */
+static const char *level_name(enum isz_log_level lvl)
+{
+    switch (lvl) {
+    case ISZ_LOG_ERROR: return "error";
+    case ISZ_LOG_WARN:  return "warn";
+    case ISZ_LOG_INFO:  return "info";
+    case ISZ_LOG_DEBUG: return "debug";
+    default:            return "?";
+    }
+}
+
+static void tinyisz_log_fn(void *userdata, enum isz_log_level level,
+                           const char *msg)
+{
+    (void)userdata;
+    fprintf(stderr, "tinyisz: %s: %s\n", level_name(level), msg);
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -202,6 +222,10 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGCHLD, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+
+    /* Wire a log sink so isz_log_internal messages reach stderr.
+     * Without this, every library error is silently swallowed. */
+    isz_set_log_callback(tinyisz_log_fn, NULL);
 
     isz_headless_config hcfg = {
         .width = (uint32_t)width,
