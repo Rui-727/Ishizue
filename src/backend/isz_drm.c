@@ -332,25 +332,53 @@ static void snapshot_planes(int drm_fd, struct isz_drm_state *st)
     drmModeFreePlaneResources(pres);
 }
 
-/* Find an unused CRTC for a connector by walking its encoder's
- * possible_crtcs mask. Returns 0 if none available. */
-static uint32_t pick_crtc_for_connector(struct isz_drm_state *st,
-                                        drmModeConnector *conn)
+/* Find an unused CRTC for a connector. Walks the connector's
+ * encoder list (conn->encoders[], falling back to conn->encoder_id
+ * for older kernels). Returns the CRTC id via *crtc_id and the
+ * CRTC's bit mask (for plane possible_crtcs matching) via *crtc_mask.
+ * Returns 0 on failure. */
+static void pick_crtc_for_connector(struct isz_drm_state *st,
+                                    drmModeConnector *conn,
+                                    uint32_t *crtc_id,
+                                    uint32_t *crtc_mask)
 {
-    if (!conn->encoder_id)
-        return 0;
-    drmModeEncoder *enc = drmModeGetEncoder(st->drm_fd, conn->encoder_id);
-    if (!enc)
-        return 0;
-    uint32_t chosen = 0;
-    for (size_t i = 0; i < st->crtc_count; i++) {
-        if (enc->possible_crtcs & (1u << i)) {
-            chosen = st->crtcs[i].crtc_id;
-            break;
-        }
+    *crtc_id = 0;
+    *crtc_mask = 0;
+    if (!conn || !st)
+        return;
+
+    /* Build the set of encoder ids to try. Prefer conn->encoder_id
+     * (the currently-bound encoder); fall back to conn->encoders[]
+     * (the full list the connector can route through). On a freshly
+     * mastered TTY, encoder_id is often 0 because no encoder is
+     * bound yet. */
+    uint32_t enc_ids[16];
+    size_t n_enc = 0;
+    if (conn->encoder_id && n_enc < 16)
+        enc_ids[n_enc++] = conn->encoder_id;
+    for (int i = 0; i < conn->count_encoders && n_enc < 16; i++) {
+        uint32_t eid = conn->encoders[i];
+        bool dup = false;
+        for (size_t j = 0; j < n_enc; j++)
+            if (enc_ids[j] == eid) { dup = true; break; }
+        if (!dup)
+            enc_ids[n_enc++] = eid;
     }
-    drmModeFreeEncoder(enc);
-    return chosen;
+
+    for (size_t e = 0; e < n_enc; e++) {
+        drmModeEncoder *enc = drmModeGetEncoder(st->drm_fd, enc_ids[e]);
+        if (!enc)
+            continue;
+        for (size_t i = 0; i < st->crtc_count; i++) {
+            if (enc->possible_crtcs & (1u << i)) {
+                *crtc_id   = st->crtcs[i].crtc_id;
+                *crtc_mask = (1u << i);
+                drmModeFreeEncoder(enc);
+                return;
+            }
+        }
+        drmModeFreeEncoder(enc);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -407,7 +435,9 @@ void isz_drm_rescan_connectors(struct isz_drm_state *st)
         if (!conn)
             continue;
         snapshot_connector(st->drm_fd, conn, &fresh[fresh_count]);
-        fresh[fresh_count].crtc_id = pick_crtc_for_connector(st, conn);
+        pick_crtc_for_connector(st, conn,
+                                &fresh[fresh_count].crtc_id,
+                                &fresh[fresh_count].crtc_mask);
         /* Preserve crtc_id from the cached snapshot if the connector
          * was already known and the cached CRTC is still valid. */
         for (size_t j = 0; j < st->connector_count; j++) {
@@ -632,8 +662,9 @@ static int isz_drm_init(struct isz_backend *self, void *config)
         if (!conn)
             continue;
         snapshot_connector(fd, conn, &st->connectors[st->connector_count]);
-        st->connectors[st->connector_count].crtc_id =
-            pick_crtc_for_connector(st, conn);
+        pick_crtc_for_connector(st, conn,
+                                &st->connectors[st->connector_count].crtc_id,
+                                &st->connectors[st->connector_count].crtc_mask);
         if (st->connectors[st->connector_count].connected)
             fire_output_hook(st, &st->connectors[st->connector_count], true);
         st->connector_count++;

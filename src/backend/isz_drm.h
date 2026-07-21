@@ -61,6 +61,7 @@ struct isz_drm_prop_cache;
 struct isz_drm_connector {
     uint32_t connector_id;
     uint32_t crtc_id;            /* 0 if not bound */
+    uint32_t crtc_mask;          /* bit index for plane possible_crtcs matching */
     uint32_t encoder_id;
     bool     connected;
     bool     enabled;

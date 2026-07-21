@@ -309,6 +309,7 @@ int isz_server_wrap_drm_output(isz_server *srv,
     out->id               = srv->next_output_id++;
     out->drm_connector_id = conn->connector_id;
     out->drm_crtc_id      = conn->crtc_id;
+    out->drm_crtc_mask    = conn->crtc_mask;
     out->is_drm           = true;
     out->dpms             = ISZ_DPMS_OFF;
     out->enabled          = false;
