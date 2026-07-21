@@ -67,6 +67,28 @@
 static volatile sig_atomic_t g_exit = 0;
 static volatile sig_atomic_t g_last_signo = 0;
 
+/* Log level: 0=error, 1=warn, 2=info, 3=debug. Read once from
+ * ISZ_LOG_LEVEL env var. Default is info (2) so the bridge doesn't
+ * flood the terminal with per-epoll_wait debug lines. */
+static int g_log_level = 2;
+
+static void init_log_level(void) {
+    const char *s = getenv("ISZ_LOG_LEVEL");
+    if (!s || !s[0]) return;
+    if (strcmp(s, "error") == 0) g_log_level = 0;
+    else if (strcmp(s, "warn") == 0) g_log_level = 1;
+    else if (strcmp(s, "info") == 0) g_log_level = 2;
+    else if (strcmp(s, "debug") == 0) g_log_level = 3;
+}
+
+static int level_num(const char *level) {
+    if (strcmp(level, "error") == 0) return 0;
+    if (strcmp(level, "warn") == 0) return 1;
+    if (strcmp(level, "info") == 0) return 2;
+    if (strcmp(level, "debug") == 0) return 3;
+    return 2;
+}
+
 static void on_signal(int signo) {
     g_last_signo = signo;
     g_exit = 1;
@@ -76,6 +98,7 @@ static void log_msg(const char *level, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
 static void log_msg(const char *level, const char *fmt, ...) {
+    if (level_num(level) > g_log_level) return;
     va_list ap;
     va_start(ap, fmt);
     fprintf(stderr, "x11bridge: %s: ", level);
@@ -392,6 +415,8 @@ static void on_isz_ready(struct isz_client *isz) {
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
+
+    init_log_level();
 
     /* Signal handling: SIGINT and SIGTERM flip g_exit. We let
      * epoll_wait return EINTR rather than using signalfd so the
