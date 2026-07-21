@@ -566,7 +566,7 @@ static int open_primary_drm_node(struct isz_drm_state *st)
 static void drm_disable_seat(struct libseat *seat, void *userdata) {
     (void)seat;
     struct isz_drm_state *st = userdata;
-    if (!st || st->drm_fd < 0) return;
+    if (!st || !st->seat || st->drm_fd < 0) return;
     st->session_active = false;
     isz_log_internal(ISZ_LOG_INFO, "drm: VT switch away, dropping master");
     if (drmDropMaster(st->drm_fd) != 0) {
@@ -581,7 +581,7 @@ static void drm_disable_seat(struct libseat *seat, void *userdata) {
 static void drm_enable_seat(struct libseat *seat, void *userdata) {
     (void)seat;
     struct isz_drm_state *st = userdata;
-    if (!st || st->drm_fd < 0) return;
+    if (!st || !st->seat || st->drm_fd < 0) return;
     isz_log_internal(ISZ_LOG_INFO, "drm: VT switch back, acquiring master");
     if (drmSetMaster(st->drm_fd) != 0) {
         isz_log_internal(ISZ_LOG_ERROR, "drm: drmSetMaster failed: %s",
@@ -620,10 +620,11 @@ static int isz_drm_init(struct isz_backend *self, void *config)
      * blocks VT switches because drmDropMaster is never called. */
     st->seat = libseat_open_seat(&drm_seat_listener, st);
     if (st->seat) {
-        /* libseat requires dispatch to surface enable_seat. We do one
-         * non-blocking drain here; the main dispatch loop drains the
-         * seat fd on every isz_dispatch call via isz_drm_dispatch. */
-        (void)libseat_dispatch(st->seat, 0);
+        /* Don't dispatch here. enable_seat would fire before drm_fd
+         * is set, and the callback's guard would return early but
+         * leave the seat un-acknowledged. The first
+         * isz_drm_read_events call drains the seat after init is
+         * complete and drm_fd is valid. */
     }
 #endif
 
