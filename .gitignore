@@ -20,3 +20,5 @@ Thumbs.db
 x11bridge/build/
 x11bridge/x11bridge
 tools/isz_compositor
+tinyisz/tinyisz
+tinyisz/*.o
