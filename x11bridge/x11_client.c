@@ -2230,7 +2230,8 @@ static int x11_client_dispatch_request(struct x11_client *c,
         uint16_t r    = x11_get_u16(buf + 8,  c->byte_order);
         uint16_t g    = x11_get_u16(buf + 10, c->byte_order);
         uint16_t b    = x11_get_u16(buf + 12, c->byte_order);
-        if (x11_client_find_colormap(c, cmap) == NULL) {
+        if (cmap != X11_DEFAULT_COLORMAP &&
+            x11_client_find_colormap(c, cmap) == NULL) {
             x11_client_send_error(c, X11_ERR_COLORMAP, cmap, opcode, 0u);
             break;
         }
@@ -2270,7 +2271,8 @@ static int x11_client_dispatch_request(struct x11_client *c,
             break;
         }
         uint32_t cmap = x11_get_u32(buf + 4, c->byte_order);
-        if (x11_client_find_colormap(c, cmap) == NULL) {
+        if (cmap != X11_DEFAULT_COLORMAP &&
+            x11_client_find_colormap(c, cmap) == NULL) {
             x11_client_send_error(c, X11_ERR_COLORMAP, cmap, opcode, 0u);
             break;
         }
@@ -2327,7 +2329,10 @@ static int x11_client_dispatch_request(struct x11_client *c,
         }
         uint32_t cmap     = x11_get_u32(buf + 4, c->byte_order);
         uint16_t name_len = x11_get_u16(buf + 8, c->byte_order);
-        if (x11_client_find_colormap(c, cmap) == NULL) {
+        /* Accept the default colormap (advertised in SetupSuccess)
+         * without requiring a CreateColormap call. */
+        if (cmap != X11_DEFAULT_COLORMAP &&
+            x11_client_find_colormap(c, cmap) == NULL) {
             x11_client_send_error(c, X11_ERR_COLORMAP, cmap, opcode, 0u);
             break;
         }
@@ -2418,11 +2423,12 @@ static int x11_client_dispatch_request(struct x11_client *c,
     }
     case X11_REQ_QUERY_FONT: {  /* 47 */
         /* QueryFont payload: 4 fontable (font or gc). Total 8 bytes.
-         * Reply: 60 bytes (8-byte header + 52 bytes of metrics), all
-         * zeroed, with reply-length = 13. v1 ships no font database:
-         * all metrics are zero, n-font-props = 0, char-infos-count =
-         * 0. If the fontable XID is neither a tracked font nor a
-         * tracked GC, BadFont. */
+         * Reply: 60 bytes (8-byte header + 52 bytes of metrics).
+         * v1 ships no font database: return plausible fixed-width
+         * metrics so apps that need ascent/descent/char-width don't
+         * bail. Values approximate a 6x13 fixed font. n-props=0,
+         * char-infos-count=0. BadFont if the fontable is neither a
+         * tracked font nor a tracked GC. */
         if (total < 8u) {
             x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
             break;
@@ -2437,13 +2443,42 @@ static int x11_client_dispatch_request(struct x11_client *c,
         uint8_t reply[60];
         memset(reply, 0, sizeof(reply));
         reply[0] = 1u;  /* reply indicator */
-        /* byte 1 unused */
         x11_put_u16(reply + 2, seq, c->byte_order);
-        x11_put_u32(reply + 4, 13u, c->byte_order);  /* reply length */
-        /* bytes 8..59: min-bounds, max-bounds, min/max char, n-props,
-         * draw-direction, byte1 fields, all-chars-exist, ascent,
-         * descent, char-infos-count. All zeroed by memset. */
-        xc_log("info", "QueryFont: font=0x%x -> 60-byte zeroed reply",
+        x11_put_u32(reply + 4, 13u, c->byte_order);  /* length = (60-8)/4 = 13 */
+
+        /* min-bounds (bytes 8-23): left=0, right=6, width=6, ascent=10,
+         * descent=3, attributes=0. Each field is 2 bytes. */
+        x11_put_u16(reply + 10, 6, c->byte_order);    /* right */
+        x11_put_u16(reply + 12, 6, c->byte_order);    /* width */
+        x11_put_u16(reply + 14, 10, c->byte_order);   /* ascent */
+        x11_put_u16(reply + 16, 3, c->byte_order);    /* descent */
+
+        /* max-bounds (bytes 24-39): same as min for fixed font */
+        x11_put_u16(reply + 26, 6, c->byte_order);
+        x11_put_u16(reply + 28, 6, c->byte_order);
+        x11_put_u16(reply + 30, 10, c->byte_order);
+        x11_put_u16(reply + 32, 3, c->byte_order);
+
+        /* min-char-or-byte2 (40), max-char-or-byte2 (42) */
+        x11_put_u16(reply + 40, 0x20, c->byte_order);   /* space */
+        x11_put_u16(reply + 42, 0x7e, c->byte_order);   /* tilde */
+
+        /* default-char (44) */
+        x11_put_u16(reply + 44, 0x3f, c->byte_order);
+
+        /* n-font-props (46) = 0 */
+        /* draw-direction (48) = 0 (LeftToRight) */
+        /* min-byte1 (49) = 0, max-byte1 (50) = 0 */
+        /* all-chars-exist (51) = 1 */
+        reply[51] = 1u;
+
+        /* font-ascent (52) = 10, font-descent (54) = 3 */
+        x11_put_u16(reply + 52, 10, c->byte_order);
+        x11_put_u16(reply + 54, 3, c->byte_order);
+
+        /* char-infos-count (56) = 0 */
+
+        xc_log("info", "QueryFont: font=0x%x -> 60-byte reply (6x13 fixed)",
                (unsigned)font_xid);
         if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
             return -1;

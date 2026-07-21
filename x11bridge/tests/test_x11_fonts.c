@@ -364,15 +364,19 @@ static int x11_client_main(void) {
         CHECK(length == 13u,
               "x11 client: QueryFont length=%u (expected 13)",
               (unsigned)length);
-        bool all_zero = true;
-        for (size_t i = 8u; i < sizeof(reply); i++) {
-            if (reply[i] != 0u) { all_zero = false; break; }
-        }
-        CHECK(all_zero,
-              "x11 client: QueryFont metrics not all zero (bytes 8..59)");
+        /* The bridge returns plausible 6x13 fixed-font metrics so
+         * apps that need ascent/descent don't bail. Verify the
+         * key fields are non-zero: font-ascent at offset 52,
+         * font-descent at offset 54. */
+        uint16_t font_ascent = get_u16_le(reply + 52);
+        uint16_t font_descent = get_u16_le(reply + 54);
+        CHECK(font_ascent > 0 && font_descent > 0,
+              "x11 client: QueryFont ascent/descent zero (got %u/%u)",
+              (unsigned)font_ascent, (unsigned)font_descent);
         fprintf(stderr,
-                "x11 client: QueryFont font=0x%x -> 60-byte zeroed reply ok\n",
-                (unsigned)font_xid);
+                "x11 client: QueryFont font=0x%x -> 60-byte reply ok (ascent=%u descent=%u)\n",
+                (unsigned)font_xid, (unsigned)font_ascent,
+                (unsigned)font_descent);
     }
 
     /* 6. QueryTextExtents. Two 2-byte chars ("AB" in 16-bit). Length
