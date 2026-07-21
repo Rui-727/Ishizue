@@ -952,4 +952,25 @@ int isz_output_get_drm_fd(isz_output *out)
     return st ? st->drm_fd : -1;
 }
 
+/* Screen capture via DRM writeback connector (SPEC §7.11).
+ *
+ * TODO: real implementation. The writeback connector should be
+ * programmed to write the composited frame into the provided
+ * dma-buf. For now this is a stub that returns ISZ_ERR_FEATURE_UNAVAIL
+ * so the library links. The capture state tracking in
+ * src/render/isz_capture.c still works; only the actual pixel
+ * capture is missing. */
+int isz_capture_drm_start(isz_output *out, int dmabuf_fd,
+                          isz_buffer_desc *desc)
+{
+    (void)out; (void)dmabuf_fd; (void)desc;
+    return ISZ_ERR_FEATURE_UNAVAIL;
+}
+
+int isz_capture_drm_stop(isz_output *out)
+{
+    (void)out;
+    return ISZ_ERR_FEATURE_UNAVAIL;
+}
+
 #endif /* ISHIZUE_HAVE_DRM */
