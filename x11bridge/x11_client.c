@@ -189,6 +189,9 @@ static int x11_client_send_error(struct x11_client *c, uint8_t error_code,
     uint16_t seq = (uint16_t)(c->sequence - 1u);  /* sequence of failing request */
     x11_build_error(buf, error_code, seq, bad_value, major_opcode, minor_opcode,
                     c->byte_order);
+    xc_log("warn", "send_error: code=%u bad_value=0x%x opcode=%u seq=%u",
+           (unsigned)error_code, (unsigned)bad_value,
+           (unsigned)major_opcode, (unsigned)seq);
     return x11_client_send_raw(c, buf, sizeof(buf));
 }
 
@@ -276,6 +279,23 @@ static int x11_client_do_setup(struct x11_client *c) {
 
     c->setup_done = true;
     xc_log("info", "setup: success, sent %zu-byte SetupSuccess", rlen);
+
+    /* Register the root window (0x100) in the per-client window
+     * table. Every X11 client queries root properties (WM_PID,
+     * _NET_SUPPORTED, etc.) at startup; without this, GetProperty
+     * on root sends BadWindow and the client aborts. The root
+     * window has no Ishizue surface; it is a logical anchor. */
+    {
+        struct x11_window *root = x11_client_new_window(c,
+                                                        X11_ROOT_WINDOW_ID);
+        if (root != NULL) {
+            root->parent_xid = 0;
+            root->mapped     = true;
+            root->override_redirect = true;
+            root->w = X11_DEFAULT_ROOT_W;
+            root->h = X11_DEFAULT_ROOT_H;
+        }
+    }
     return 0;
 }
 
@@ -444,6 +464,42 @@ static struct x11_gc *x11_client_alloc_gc(struct x11_client *c, uint32_t gc_xid)
         }
     }
     return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-client pixmap tracking                                          */
+/* ------------------------------------------------------------------ */
+
+static struct x11_pixmap *x11_client_find_pixmap(struct x11_client *c,
+                                                   uint32_t pix_xid) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_PIX; i++) {
+        if (c->pixmaps[i].in_use && c->pixmaps[i].pixmap_xid == pix_xid) {
+            return &c->pixmaps[i];
+        }
+    }
+    return NULL;
+}
+
+static struct x11_pixmap *x11_client_alloc_pixmap(struct x11_client *c,
+                                                    uint32_t pix_xid) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_PIX; i++) {
+        if (!c->pixmaps[i].in_use) {
+            memset(&c->pixmaps[i], 0, sizeof(c->pixmaps[i]));
+            c->pixmaps[i].in_use     = true;
+            c->pixmaps[i].pixmap_xid = pix_xid;
+            return &c->pixmaps[i];
+        }
+    }
+    return NULL;
+}
+
+/* Check if a drawable XID is valid: root window, a tracked window, or
+ * a tracked pixmap. Returns the drawable type or 0 if not found. */
+static int x11_client_check_drawable(struct x11_client *c, uint32_t draw) {
+    if (draw == X11_ROOT_WINDOW_ID) return 1;  /* root */
+    if (x11_client_find_window(c, draw) != NULL) return 2;  /* window */
+    if (x11_client_find_pixmap(c, draw) != NULL) return 3;  /* pixmap */
+    return 0;  /* not found */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1520,14 +1576,11 @@ static int x11_client_dispatch_request(struct x11_client *c,
         uint32_t draw   = x11_get_u32(payload + 4, c->byte_order);
         uint32_t vmask  = x11_get_u32(payload + 8, c->byte_order);
         size_t vremaining = (payload_len > 12u) ? payload_len - 12u : 0u;
-        /* The drawable must be tracked (a window). Pixmaps are not
-         * yet tracked; a CreateGC on a pixmap gets a Drawable error. */
-        if (draw != X11_ROOT_WINDOW_ID) {
-            struct x11_window *win = x11_client_find_window(c, draw);
-            if (win == NULL) {
-                x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
-                break;
-            }
+        /* The drawable must be root, a tracked window, or a tracked
+         * pixmap. */
+        if (x11_client_check_drawable(c, draw) == 0) {
+            x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
+            break;
         }
         if (x11_client_find_gc(c, gc_xid) != NULL) {
             x11_client_send_error(c, X11_ERR_IDCHOICE, gc_xid, opcode, 0u);
@@ -1638,21 +1691,22 @@ static int x11_client_dispatch_request(struct x11_client *c,
             break;
         }
         (void)gc_xid; (void)dst_x; (void)dst_y; (void)left_pad;
-        /* The drawable must be a tracked window. Pixmaps are not yet
-         * tracked; a PutImage on a pixmap gets a Drawable error. */
-        struct x11_window *win = NULL;
         if (draw == X11_ROOT_WINDOW_ID) {
-            /* Root window PutImage is allowed; the bridge does not
-             * track a backing store for root, so the data is
-             * accepted and discarded. */
             xc_log("info",
-                   "PutImage: on root, %zu bytes discarded (no root backing)",
+                   "PutImage: on root, %zu bytes discarded",
                    data_bytes);
             break;
         }
-        win = x11_client_find_window(c, draw);
-        if (win == NULL) {
+        if (x11_client_check_drawable(c, draw) == 0) {
             x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
+            break;
+        }
+        struct x11_window *win = x11_client_find_window(c, draw);
+        if (win == NULL) {
+            /* Pixmap: accept and discard. */
+            xc_log("debug",
+                   "PutImage: on pixmap 0x%x, %zu bytes discarded",
+                   (unsigned)draw, data_bytes);
             break;
         }
         /* Stash the image data on the window. */
@@ -1675,6 +1729,105 @@ static int x11_client_dispatch_request(struct x11_client *c,
                "PutImage: drawable=0x%x %ux%u depth=%u format=%u data=%zu",
                (unsigned)draw, (unsigned)width, (unsigned)height,
                (unsigned)depth, (unsigned)format, data_bytes);
+        break;
+    }
+    case 53: {  /* CreatePixmap */
+        /* CreatePixmap payload: 1 depth (header byte 1), 4 pid, 4
+         * drawable, 2 width, 2 height. Total 16 bytes. No reply. */
+        if (total < 16) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint8_t  depth = data;
+        uint32_t pid   = x11_get_u32(buf + 4, c->byte_order);
+        uint32_t draw  = x11_get_u32(buf + 8, c->byte_order);
+        uint16_t w     = x11_get_u16(buf + 12, c->byte_order);
+        uint16_t h     = x11_get_u16(buf + 14, c->byte_order);
+        if (x11_client_check_drawable(c, draw) == 0) {
+            x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
+            break;
+        }
+        if (x11_client_find_pixmap(c, pid) != NULL) {
+            x11_client_send_error(c, X11_ERR_IDCHOICE, pid, opcode, 0u);
+            break;
+        }
+        struct x11_pixmap *pix = x11_client_alloc_pixmap(c, pid);
+        if (pix == NULL) {
+            x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+            break;
+        }
+        pix->drawable_xid = draw;
+        pix->width  = w;
+        pix->height = h;
+        pix->depth  = depth;
+        break;
+    }
+    case 54: {  /* FreePixmap */
+        /* FreePixmap payload: 4 pixmap. Total 8 bytes. No reply. */
+        if (total < 8) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t pid = x11_get_u32(buf + 4, c->byte_order);
+        struct x11_pixmap *pix = x11_client_find_pixmap(c, pid);
+        if (pix == NULL) {
+            x11_client_send_error(c, X11_ERR_PIXMAP, pid, opcode, 0u);
+            break;
+        }
+        pix->in_use = false;
+        break;
+    }
+    case 98: {  /* QueryExtension */
+        if (total < 8) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint16_t name_len = x11_get_u16(buf + 4, c->byte_order);
+        if (total < (size_t)(8 + ((name_len + 3u) & ~3u))) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        const char *name = (const char *)(buf + 8);
+        char ext_name[256];
+        size_t copy = name_len < sizeof(ext_name) - 1 ? name_len : sizeof(ext_name) - 1;
+        memcpy(ext_name, name, copy);
+        ext_name[copy] = '\0';
+
+        /* Reply with present=0 so the client falls back to core
+         * protocol. The bridge supports no extensions yet. */
+        uint8_t reply[32];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 1;  /* reply */
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        x11_put_u32(reply + 4, 0, c->byte_order);  /* length */
+        reply[8] = 0;  /* present = false */
+        x11_client_send_raw(c, reply, sizeof(reply));
+        xc_log("debug", "QueryExtension: '%s' -> not present", ext_name);
+        break;
+    }
+    case 99: {  /* ListExtensions */
+        uint8_t reply[32];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 1;  /* reply */
+        reply[1] = 0;  /* count = 0 */
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        x11_put_u32(reply + 4, 0, c->byte_order);
+        x11_client_send_raw(c, reply, sizeof(reply));
+        xc_log("debug", "ListExtensions -> 0 extensions");
+        break;
+    }
+    case 43: {  /* GetInputFocus */
+        uint8_t reply[32];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 1;  /* reply */
+        reply[1] = 0;  /* revert-to = None */
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        x11_put_u32(reply + 4, 0, c->byte_order);
+        x11_put_u32(reply + 8, 0, c->byte_order);  /* focus = None */
+        x11_client_send_raw(c, reply, sizeof(reply));
+        break;
+    }
+    case 119: {  /* NoOperation */
         break;
     }
     default:

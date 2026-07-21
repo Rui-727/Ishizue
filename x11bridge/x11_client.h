@@ -32,6 +32,7 @@
 #define X11_CLIENT_MAX_WIN    64   /* windows tracked per client */
 #define X11_CLIENT_MAX_PROPS  16   /* properties per window */
 #define X11_PROP_MAX_BYTES    4096 /* per-property value cap */
+#define X11_CLIENT_MAX_PIX    32   /* pixmaps tracked per client */
 #define X11_CLIENT_MAX_GCS    32   /* graphics contexts per client */
 #define X11_CLIENT_MAX_SELS   8    /* selection ownerships per client */
 #define X11_PUT_IMAGE_MAX_BYTES  (64u * 1024u)  /* per-PutImage data cap */
@@ -132,6 +133,18 @@ struct x11_selection {
     uint32_t  timestamp;
 };
 
+/* Pixmap tracking. Pixmaps are drawables that the client can CreateGC
+ * on, PutImage into, CopyArea from, etc. The bridge stores only the
+ * geometry; pixel data is not retained (no rendering in v1). */
+struct x11_pixmap {
+    bool      in_use;
+    uint32_t  pixmap_xid;
+    uint32_t  drawable_xid;   /* the drawable CreatePixmap was issued on */
+    uint16_t  width;
+    uint16_t  height;
+    uint8_t   depth;
+};
+
 struct x11_client {
     int      fd;
     bool     setup_done;          /* setup_request received, success sent */
@@ -155,6 +168,10 @@ struct x11_client {
     /* Window table: X11 window id -> bridge state. Indexed by slot;
      * linear scan on lookup. v1 client window counts are small. */
     struct x11_window windows[X11_CLIENT_MAX_WIN];
+
+    /* Pixmap table: X11 pixmap id -> geometry. v1 stores no pixel
+     * data; rendering is deferred. */
+    struct x11_pixmap pixmaps[X11_CLIENT_MAX_PIX];
 
     /* W9-B: graphics-context table. Keyed by client-allocated GC
      * XID. Linear scan; v1 client GC counts are small. */
