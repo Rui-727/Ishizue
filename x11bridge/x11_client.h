@@ -23,7 +23,13 @@
  * AllocColor, QueryColors, LookupColor). Per-client state gained a
  * colormap table. The bridge does no real color allocation; AllocColor
  * echoes the requested RGB and returns a packed pixel, QueryColors
- * unpacks each pixel as 0x00RRGGBB, and LookupColor returns black. */
+ * unpacks each pixel as 0x00RRGGBB, and LookupColor returns black.
+ *
+ * W10-A: five rendering opcodes added (FreeGC, ClearArea, CopyArea,
+ * PolyFillRectangle, GetImage). Per-window state gained a
+ * background_pixel field so ClearArea can paint with it. GetImage
+ * reads back from the PutImage backing store; CopyArea and
+ * PolyFillRectangle no-op the pixel copy in v1. */
 
 #ifndef X11_CLIENT_H
 #define X11_CLIENT_H

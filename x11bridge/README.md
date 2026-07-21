@@ -18,12 +18,12 @@ library lands.
 - Accepts X11 client connections and replies with a real
   `setup_success` (one screen, one pixmap format, one TrueColor
   visual of depth 24).
-- Parses and dispatches twenty core opcodes end-to-end:
+- Parses and dispatches thirty-six core opcodes end-to-end:
   - `CreateWindow` (1): allocate an Ishizue surface, set position
     and size.
   - `ChangeWindowAttributes` (2): store event-mask,
     override-redirect, cursor, bit/win-gravity, backing-store,
-    colormap, save-under, do-not-propagate-mask.
+    colormap, save-under, do-not-propagate-mask, background-pixel.
   - `GetWindowAttributes` (3): reply with class, visual, map-state,
     map-installed, override-redirect, colormap, event-mask,
     do-not-propagate-mask from per-window state.
@@ -58,12 +58,36 @@ library lands.
   - `SetInputFocus` (42): store focus window and revert-to policy;
     translate to isz_seat_set_keyboard_focus on the focused surface
     (or surface 0 to clear).
+  - `GetInputFocus` (43): reply with focus=0, revert-to=None.
+  - `CreatePixmap` (53): track pixmap geometry; no pixel storage.
+  - `FreePixmap` (54): mark the pixmap slot free.
   - `CreateGC` (55): store a graphics context keyed by client-chosen
     XID with the value-list attributes (graphics-exposure,
     foreground, background, line-width, etc.).
+  - `FreeGC` (60): mark the GC slot free. BadGC if the XID is not
+    tracked.
+  - `ClearArea` (61): if the window has a ZPixmap depth-24 backing
+    image, paint the rect with background_pixel. width=0 or height=0
+    means "to the end". Emit Expose if the exposures flag is set.
+  - `CopyArea` (62): validate src, dst, gc; no-op the pixel copy.
+    Emit NoExpose if the GC has graphics-exposure=false.
+  - `PolyFillRectangle` (69): validate drawable and gc; accept and
+    discard the rectangle list. No rendering in v1.
   - `PutImage` (72): stash the image data on the drawable as a
-    backing store (window only; root is accepted and discarded).
+    backing store (window only; root and pixmaps discard).
     GraphicsExposure generation is skipped in v1.
+  - `GetImage` (73): for a window with a ZPixmap depth-24 backing
+    image, return the backing image rect; elsewhere return zeros.
+    Reply depth matches the drawable's depth.
+  - `CreateColormap` (78): track colormap XID; no real allocation.
+  - `FreeColormap` (79): mark the colormap slot free.
+  - `AllocColor` (84): echo the requested RGB, return a packed
+    0x00RRGGBB pixel.
+  - `QueryColors` (91): unpack each pixel as 0x00RRGGBB.
+  - `LookupColor` (92): return exact RGB = screen RGB = (0,0,0).
+  - `QueryExtension` (98): reply present=0 for every name.
+  - `ListExtensions` (99): reply with 0 extensions.
+  - `NoOperation` (119): silently consumed.
 - Forwards Ishizue input events to the first mapped X11 top-level
   window:
   - `ISZ_MSG_INPUT_KEYBOARD_KEY` -> X11 `KeyPress` / `KeyRelease`.
@@ -133,12 +157,13 @@ re-registering.
 The following are known gaps, not bugs:
 
 - No X11 error messages for unsupported opcodes. The bridge silently
-  drops opcodes it does not handle (QueryExtension, GetInputFocus,
-  PolyText, CreatePixmap, CopyArea, and most others). Real X11
-  clients that block on a reply from those opcodes will stall.
+  drops opcodes it does not handle (PolyText, ImageText, CopyPlane,
+  vector drawing other than PolyFillRectangle, and most others). Real
+  X11 clients that block on a reply from those opcodes will stall.
   Reply-bearing opcodes that the bridge does handle (GetWindowAttributes,
   GetGeometry, QueryTree, InternAtom, GetAtomName, GetProperty,
-  GetSelectionOwner, QueryPointer) work end-to-end.
+  GetSelectionOwner, QueryPointer, GetImage, AllocColor, QueryColors,
+  LookupColor) work end-to-end.
 - No focus tracking. Forwarded input events go to the first mapped
   top-level window across all X11 clients. SetInputFocus stores the
   focus XID and translates it to a seat_set_keyboard_focus wire
@@ -185,9 +210,12 @@ The following are known gaps, not bugs:
   only to the client that issued the trigger request.
 - No CreateNotify. The bridge does not emit CreateNotify for new
   windows; the test does not require it.
-- No GraphicsExposure / NoExpose. PutImage (72) accepts the request
-  and stashes the data but never emits GraphicsExposure or NoExpose,
-  even when the GC has graphics-exposure=true.
+- No GraphicsExposure from CopyArea. CopyArea (62) emits NoExpose
+  when the GC has graphics-exposure=false, but does not emit
+  GraphicsExposure when graphics-exposure=true and the source region
+  is "lost". The bridge has no real backing-store loss tracking, so
+  it emits nothing in the graphics-exposure=true case. PutImage (72)
+  never emits GraphicsExposure or NoExpose.
 - No ConvertSelection. The bridge tracks selection ownership but
   does not route ConvertSelection (24) to the owner or generate
   SelectionRequest / SelectionNotify events.
@@ -204,13 +232,14 @@ x11bridge/
                      QueryPointer, MapNotify, UnmapNotify,
                      ConfigureNotify, DestroyNotify, PropertyNotify,
                      SelectionClear, SelectionRequest, SelectionNotify,
-                     GraphicsExposure, NoExpose
+                     GraphicsExposure, NoExpose, Expose
   x11_atoms.h/.c     bridge-global atom table (predefined 1..68 +
                      dynamic allocation from 69 up)
   x11_client.h/.c    per-X11-client state, setup handshake, request
-                     parser; dispatches the twenty handled opcodes;
+                     parser; dispatches thirty-six handled opcodes;
                      per-window properties, GC table, selection
-                     table, focus state, PutImage backing store
+                     table, colormap table, focus state, PutImage
+                     backing store
   isz_client.h/.c    client side of the Ishizue wire protocol
   translation.h/.c   X11 <-> Ishizue mapping (surface create/destroy,
                      set_position/set_size/set_plane_type/
@@ -231,6 +260,13 @@ x11bridge/
                               SetSelectionOwner, GetSelectionOwner,
                               QueryPointer, SetInputFocus, CreateGC,
                               PutImage end-to-end
+  tests/test_x11_colormap.c   W10-B test: CreateColormap,
+                              FreeColormap, AllocColor, QueryColors,
+                              LookupColor end-to-end
+  tests/test_x11_render.c     W10-A test: CreateGC, PutImage,
+                              GetImage (verify roundtrip), ClearArea,
+                              GetImage (verify zeroed), PolyFillRectangle,
+                              CopyArea, FreeGC end-to-end
 ```
 
 ## License

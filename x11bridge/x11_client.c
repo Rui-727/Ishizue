@@ -40,7 +40,18 @@
  * echoes the requested RGB and returns a packed 0x00RRGGBB pixel,
  * QueryColors unpacks each pixel as 0x00RRGGBB, and LookupColor
  * returns exact RGB = screen RGB = (0,0,0) because the bridge ships
- * no Xrgb.txt color database. */
+ * no Xrgb.txt color database.
+ *
+ * W10-A: five rendering opcodes added (FreeGC, ClearArea, CopyArea,
+ * PolyFillRectangle, GetImage). Per-window state gained a
+ * background_pixel field (parsed from CW_BG_PIXEL). ClearArea paints
+ * the rect with background_pixel on a ZPixmap depth-24 backing image
+ * and emits Expose if the exposures flag is set. CopyArea validates
+ * src/dst/gc and no-ops the pixel copy; emits NoExpose when the GC
+ * has graphics-exposure=false. PolyFillRectangle validates drawable
+ * and gc and discards the rectangle list. GetImage returns the
+ * backing image rect for a ZPixmap depth-24 window; elsewhere
+ * returns zeros. FreeGC marks the GC slot free. */
 
 #define _GNU_SOURCE 1  /* accept4, MSG_NOSIGNAL */
 
