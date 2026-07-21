@@ -81,7 +81,13 @@ LIBDIR  ?= $(PREFIX)/lib
 INCLUDEDIR ?= $(PREFIX)/include
 
 .PHONY: all clean install uninstall test check
-all: $(LIB_NAME) $(LIB_SONAME) $(LIB_LINK)
+all: $(LIB_NAME) $(LIB_SONAME) $(LIB_LINK) all-bin
+
+# Build the binaries that depend on the library.
+all-bin:
+	@$(MAKE) -C x11bridge
+	@$(MAKE) -C tinyisz
+	@$(MAKE) -C tools
 
 $(LIB_NAME): $(OBJS) libishizue.map
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
@@ -187,3 +193,7 @@ uninstall:
 clean:
 	rm -f $(OBJS) $(LIB_NAME) $(LIB_SONAME) $(LIB_LINK)
 	$(MAKE) -C tests clean 2>/dev/null || true
+	$(MAKE) -C x11bridge clean 2>/dev/null || true
+	$(MAKE) -C tinyisz clean 2>/dev/null || true
+	$(MAKE) -C tools clean 2>/dev/null || true
+	rm -rf build-test
