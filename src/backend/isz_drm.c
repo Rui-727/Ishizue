@@ -917,6 +917,30 @@ int isz_drm_set_server(struct isz_backend *b, struct isz_server *srv)
                              strerror(errno));
         }
     }
+
+    /* Add the libseat session fd to the epoll set so VT switch
+     * events are polled. Without this, libseat_dispatch only runs
+     * when the DRM fd has events (page-flips), and disable_seat
+     * never fires. The kernel blocks the VT switch because
+     * drmDropMaster is never called. */
+#ifdef ISHIZUE_HAVE_LIBSEAT
+    if (srv && st->seat) {
+        int seat_fd = libseat_get_fd(st->seat);
+        if (seat_fd >= 0) {
+            struct isz_fd_tag *tag = &srv->seat_tag;
+            tag->kind   = ISZ_FD_SEAT;
+            tag->opaque = NULL;
+            struct epoll_event ev;
+            ev.events   = EPOLLIN;
+            ev.data.ptr = tag;
+            if (epoll_ctl(srv->epoll_fd, EPOLL_CTL_ADD, seat_fd, &ev) < 0) {
+                isz_log_internal(ISZ_LOG_WARN,
+                                 "drm: epoll_ctl ADD seat_fd failed: %s",
+                                 strerror(errno));
+            }
+        }
+    }
+#endif
     return ISZ_OK;
 }
 

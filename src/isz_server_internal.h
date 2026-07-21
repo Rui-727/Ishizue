@@ -90,6 +90,7 @@ enum isz_fd_kind {
     ISZ_FD_CLIENT  = 1,  /* a connected client socket */
     ISZ_FD_PSI     = 2,  /* /sys/kernel/mm/pressure/memory trigger fd */
     ISZ_FD_BACKEND = 3,  /* backend-provided fd (DRM page-flip, etc.) */
+    ISZ_FD_SEAT    = 4,  /* libseat session fd (VT switch events) */
 };
 
 struct isz_fd_tag {
@@ -332,6 +333,7 @@ struct isz_server {
     struct isz_fd_tag       listen_tag;
     struct isz_fd_tag       psi_tag;
     struct isz_fd_tag       backend_tag;
+    struct isz_fd_tag       seat_tag;
 
     /* Logging. The runtime filter lives in W1-A's isz_log.c (process-
      * wide statics, since isz_set_log_callback predates the server

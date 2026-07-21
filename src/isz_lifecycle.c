@@ -349,6 +349,16 @@ ISZ_API void isz_dispatch(isz_server *srv)
                                          "isz_dispatch: backend read_events rc=%d", rc);
                 }
                 break;
+            case ISZ_FD_SEAT:
+                /* libseat session fd: drain the session so
+                 * enable_seat / disable_seat fire. disable_seat
+                 * calls drmDropMaster so the kernel can complete
+                 * the VT switch. Without this the switch hangs. */
+                isz_session_dispatch(srv);
+                if (srv->backend) {
+                    (void)isz_backend_read_events(srv->backend);
+                }
+                break;
             }
         }
         if (n < 0) {
