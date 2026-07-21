@@ -58,12 +58,13 @@
 #define X11_RELEASE_NUMBER     11800000u
 
 /* Request major opcodes the bridge handles. W8-A grew the set from
- * {CreateWindow, GetGeometry} to ten opcodes. W9-B grows it to twenty:
- * adds GetWindowAttributes, QueryTree, GetAtomName, DeleteProperty,
- * SetSelectionOwner, GetSelectionOwner, QueryPointer, SetInputFocus,
- * CreateGC, PutImage. Other opcodes the scaffold must accept
- * (QueryExtension, GetInputFocus, ...) stay in the no-op default
- * branch; see x11_client.c. */
+ * {CreateWindow, GetGeometry} to ten opcodes. W9-B grows it to twenty.
+ * W10-A adds five rendering opcodes: FreeGC, ClearArea, CopyArea,
+ * PolyFillRectangle, GetImage. W10-B adds five colormap opcodes:
+ * CreateColormap, FreeColormap, AllocColor, QueryColors, LookupColor.
+ * Other opcodes the scaffold must accept (QueryExtension,
+ * GetInputFocus, ...) stay in the no-op default branch; see
+ * x11_client.c. */
 enum x11_request {
     X11_REQ_CREATE_WINDOW        = 1,
     X11_REQ_CHANGE_WINDOW_ATTRS  = 2,
@@ -85,9 +86,23 @@ enum x11_request {
     X11_REQ_SET_INPUT_FOCUS      = 42,
     X11_REQ_GET_INPUT_FOCUS      = 43,
     X11_REQ_CREATE_GC            = 55,
+    X11_REQ_FREE_GC              = 60,
+    X11_REQ_CLEAR_AREA           = 61,
+    X11_REQ_COPY_AREA            = 62,
+    X11_REQ_POLY_FILL_RECTANGLE  = 69,
     X11_REQ_PUT_IMAGE            = 72,
+    X11_REQ_GET_IMAGE            = 73,
+    X11_REQ_CREATE_COLORMAP      = 78,
+    X11_REQ_FREE_COLORMAP        = 79,
+    X11_REQ_ALLOC_COLOR          = 84,
+    X11_REQ_QUERY_COLORS         = 91,
+    X11_REQ_LOOKUP_COLOR         = 92,
     X11_REQ_QUERY_EXTENSION      = 98,
 };
+
+/* CreateColormap alloc values (header byte 1). */
+#define X11_ALLOC_NONE  0u
+#define X11_ALLOC_ALL   1u
 
 /* CreateWindow value-mask bits (X11 protocol spec, low bit first). The
  * value-list that follows the mask carries one 4-byte slot per set
@@ -603,5 +618,16 @@ size_t   x11_build_no_expose(uint8_t *out_buf,
                              uint16_t minor_opcode,
                              uint8_t major_opcode,
                              uint16_t sequence, uint8_t byte_order);
+
+/* Build a 32-byte Expose event. Emitted when a window region needs
+ * repaint: by ClearArea(exposures=true) and by future damage
+ * sources. count is the number of Expose events that follow for the
+ * same source; 0 when this is the last. */
+size_t   x11_build_expose(uint8_t *out_buf,
+                          uint32_t window,
+                          uint16_t x, uint16_t y,
+                          uint16_t width, uint16_t height,
+                          uint16_t count,
+                          uint16_t sequence, uint8_t byte_order);
 
 #endif /* X11_PROTO_H */

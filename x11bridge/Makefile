@@ -49,9 +49,13 @@ TEST2_BIN := tests/test_x11_opcodes
 TEST2_SRC := tests/test_x11_opcodes.c
 TEST3_BIN := tests/test_x11_opcodes2
 TEST3_SRC := tests/test_x11_opcodes2.c
+TEST4_BIN := tests/test_x11_colormap
+TEST4_SRC := tests/test_x11_colormap.c
+TEST5_BIN := tests/test_x11_render
+TEST5_SRC := tests/test_x11_render.c
 
 .PHONY: all clean test
-all: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN)
+all: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN)
 
 $(BIN): $(OBJS)
 	@if [ ! -f ../libishizue.so ] && [ "$(BRIDGE_LDLIBS)" = "-L.. -lishizue" ]; then \
@@ -97,9 +101,25 @@ $(TEST3_BIN): $(TEST3_SRC)
 	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
 		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
 
+# W10-B integration test: exercises CreateColormap, FreeColormap,
+# AllocColor, QueryColors, LookupColor on the headless backend.
+$(TEST4_BIN): $(TEST4_SRC)
+	@mkdir -p tests
+	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
+		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+
+# W10-A integration test: exercises FreeGC, ClearArea, CopyArea,
+# PolyFillRectangle, GetImage on the headless backend. Verifies that
+# GetImage returns the bytes PutImage stashed, and that ClearArea
+# zeroes the cleared rect in the backing image.
+$(TEST5_BIN): $(TEST5_SRC)
+	@mkdir -p tests
+	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
+		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+
 # Build + run the integration tests. Runs from the repo root so the
 # default bridge binary path (x11bridge/x11bridge) resolves.
-test: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN)
+test: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN)
 	@cd .. && \
 		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
 		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
@@ -112,7 +132,14 @@ test: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN)
 		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
 		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
 		./x11bridge/tests/test_x11_opcodes2
+	@cd .. && \
+		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+		./x11bridge/tests/test_x11_colormap
+	@cd .. && \
+		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+		./x11bridge/tests/test_x11_render
 
 clean:
-	rm -rf $(BUILD_DIR) $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN)
-
+	rm -rf $(BUILD_DIR) $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN)

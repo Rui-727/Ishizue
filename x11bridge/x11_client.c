@@ -23,16 +23,24 @@
 
 /* x11_client.c: per-X11-client state and request parser.
  *
- * W9-B: the dispatcher now handles twenty core opcodes end-to-end.
- * The ten W8-A opcodes plus GetWindowAttributes, QueryTree,
- * GetAtomName, DeleteProperty, SetSelectionOwner, GetSelectionOwner,
- * QueryPointer, SetInputFocus, CreateGC, PutImage. New per-client
- * state: GC table, selection table, keyboard focus. Each handler
- * updates the relevant state, emits the corresponding Ishizue wire
- * message(s) via translation.c, and generates the relevant X11
- * event(s) when the client selected for them. Unknown opcodes are
- * still silently consumed (logged at debug) so a client that probes
- * extensions does not stall. */
+ * W9-B: the dispatcher handles twenty core opcodes end-to-end. The
+ * ten W8-A opcodes plus GetWindowAttributes, QueryTree, GetAtomName,
+ * DeleteProperty, SetSelectionOwner, GetSelectionOwner, QueryPointer,
+ * SetInputFocus, CreateGC, PutImage. New per-client state: GC table,
+ * selection table, keyboard focus. Each handler updates the relevant
+ * state, emits the corresponding Ishizue wire message(s) via
+ * translation.c, and generates the relevant X11 event(s) when the
+ * client selected for them. Unknown opcodes are still silently
+ * consumed (logged at debug) so a client that probes extensions does
+ * not stall.
+ *
+ * W10-B: five colormap opcodes added (CreateColormap, FreeColormap,
+ * AllocColor, QueryColors, LookupColor). Per-client state gained a
+ * colormap table. The bridge does no real color allocation; AllocColor
+ * echoes the requested RGB and returns a packed 0x00RRGGBB pixel,
+ * QueryColors unpacks each pixel as 0x00RRGGBB, and LookupColor
+ * returns exact RGB = screen RGB = (0,0,0) because the bridge ships
+ * no Xrgb.txt color database. */
 
 #define _GNU_SOURCE 1  /* accept4, MSG_NOSIGNAL */
 
@@ -342,6 +350,9 @@ static bool parse_window_value_list(const uint8_t *vp, size_t remaining,
         case X11_CW_BACKING_PIXEL:
             win->backing_pixel = v;
             break;
+        case X11_CW_BG_PIXEL:
+            win->background_pixel = v;
+            break;
         case X11_CW_OVERRIDE_REDIRECT:
             win->override_redirect = (v != 0u);
             break;
@@ -503,6 +514,34 @@ static int x11_client_check_drawable(struct x11_client *c, uint32_t draw) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Per-client colormaps (W10-B)                                          */
+/* ------------------------------------------------------------------ */
+
+static struct x11_colormap *x11_client_find_colormap(struct x11_client *c,
+                                                     uint32_t cmap_xid) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_CMAPS; i++) {
+        if (c->colormaps[i].in_use &&
+            c->colormaps[i].colormap_xid == cmap_xid) {
+            return &c->colormaps[i];
+        }
+    }
+    return NULL;
+}
+
+static struct x11_colormap *x11_client_alloc_colormap(struct x11_client *c,
+                                                      uint32_t cmap_xid) {
+    for (size_t i = 0; i < X11_CLIENT_MAX_CMAPS; i++) {
+        if (!c->colormaps[i].in_use) {
+            memset(&c->colormaps[i], 0, sizeof(c->colormaps[i]));
+            c->colormaps[i].in_use       = true;
+            c->colormaps[i].colormap_xid = cmap_xid;
+            return &c->colormaps[i];
+        }
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
 /* Per-client selection ownership (W9-B)                                */
 /* ------------------------------------------------------------------ */
 
@@ -652,6 +691,7 @@ static int x11_client_dispatch_request(struct x11_client *c,
         win->backing_store        = tmp.backing_store;
         win->backing_planes       = tmp.backing_planes;
         win->backing_pixel        = tmp.backing_pixel;
+        win->background_pixel     = tmp.background_pixel;
         win->colormap             = tmp.colormap;
         win->save_under           = tmp.save_under;
         win->do_not_propagate_mask = tmp.do_not_propagate_mask;
@@ -1731,6 +1771,247 @@ static int x11_client_dispatch_request(struct x11_client *c,
                (unsigned)depth, (unsigned)format, data_bytes);
         break;
     }
+    case X11_REQ_FREE_GC: {
+        /* FreeGC payload: 4 gc. Total 8 bytes. No reply. Marks the
+         * GC slot free. BadGC if the XID is not tracked. */
+        if (total < 8) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t gc_xid = x11_get_u32(buf + 4, c->byte_order);
+        struct x11_gc *gc = x11_client_find_gc(c, gc_xid);
+        if (gc == NULL) {
+            x11_client_send_error(c, X11_ERR_GCONTEXT, gc_xid, opcode, 0u);
+            break;
+        }
+        gc->in_use = false;
+        xc_log("info", "FreeGC: gc=0x%x", (unsigned)gc_xid);
+        break;
+    }
+    case X11_REQ_CLEAR_AREA: {
+        /* ClearArea payload: 1 exposures (header byte 1 = data),
+         * 4 window, 2 x, 2 y, 2 width, 2 height. Total 16 bytes. No
+         * reply. v1: if the window has a ZPixmap depth-24 backing
+         * image, paint the rect with background_pixel. width=0 or
+         * height=0 means "to the end" per X11. If exposures=true,
+         * emit Expose to clients that selected Exposure. */
+        uint8_t exposures = data;
+        if (total < 16) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t wid = x11_get_u32(buf + 4, c->byte_order);
+        int16_t  x   = (int16_t)x11_get_u16(buf + 8,  c->byte_order);
+        int16_t  y   = (int16_t)x11_get_u16(buf + 10, c->byte_order);
+        uint16_t w   = x11_get_u16(buf + 12, c->byte_order);
+        uint16_t h   = x11_get_u16(buf + 14, c->byte_order);
+        struct x11_window *win = x11_client_find_window(c, wid);
+        if (win == NULL) {
+            x11_client_send_error(c, X11_ERR_WINDOW, wid, opcode, 0u);
+            break;
+        }
+        if (win->backing_image != NULL &&
+            win->backing_image_format == X11_IMAGE_FORMAT_ZPIXMAP &&
+            win->backing_image_depth == 24u) {
+            uint32_t bg = win->background_pixel;
+            int32_t bw = (int32_t)win->backing_image_w;
+            int32_t bh = (int32_t)win->backing_image_h;
+            int32_t rw = (w == 0u) ? bw - (int32_t)x : (int32_t)w;
+            int32_t rh = (h == 0u) ? bh - (int32_t)y : (int32_t)h;
+            if (rw < 0) rw = 0;
+            if (rh < 0) rh = 0;
+            for (int32_t row = 0; row < rh; row++) {
+                int32_t py = (int32_t)y + row;
+                if (py < 0 || py >= bh) continue;
+                for (int32_t col = 0; col < rw; col++) {
+                    int32_t px = (int32_t)x + col;
+                    if (px < 0 || px >= bw) continue;
+                    size_t off = ((size_t)py * (size_t)bw + (size_t)px) * 4u;
+                    if (off + 4u > win->backing_image_len) continue;
+                    x11_put_u32(win->backing_image + off, bg, c->byte_order);
+                }
+            }
+        }
+        if (exposures != 0u) {
+            uint16_t ex = (x < 0) ? 0u : (uint16_t)x;
+            uint16_t ey = (y < 0) ? 0u : (uint16_t)y;
+            uint8_t evt[32];
+            x11_build_expose(evt, win->x11_id, ex, ey, w, h, 0u,
+                             seq, c->byte_order);
+            (void)translation_deliver_event(c, evt,
+                                            X11_EVMASK_EXPOSURE,
+                                            win->x11_id);
+        }
+        xc_log("info",
+               "ClearArea: wid=0x%x rect=(%d,%d,%ux%u) exposures=%d",
+               (unsigned)wid, (int)x, (int)y, (unsigned)w, (unsigned)h,
+               (int)exposures);
+        break;
+    }
+    case X11_REQ_COPY_AREA: {
+        /* CopyArea payload: 4 src drawable, 4 dst drawable, 4 gc,
+         * 2 src-x, 2 src-y, 2 dst-x, 2 dst-y, 2 width, 2 height.
+         * Total 28 bytes. No reply. v1: accept and no-op the pixel
+         * copy. If the GC has graphics-exposure=false, emit NoExpose
+         * to the originating client. */
+        if (total < 28) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t src_draw = x11_get_u32(buf + 4,  c->byte_order);
+        uint32_t dst_draw = x11_get_u32(buf + 8,  c->byte_order);
+        uint32_t gc_xid   = x11_get_u32(buf + 12, c->byte_order);
+        if (x11_client_check_drawable(c, src_draw) == 0) {
+            x11_client_send_error(c, X11_ERR_DRAWABLE, src_draw, opcode, 0u);
+            break;
+        }
+        if (x11_client_check_drawable(c, dst_draw) == 0) {
+            x11_client_send_error(c, X11_ERR_DRAWABLE, dst_draw, opcode, 0u);
+            break;
+        }
+        struct x11_gc *gc = x11_client_find_gc(c, gc_xid);
+        if (gc == NULL) {
+            x11_client_send_error(c, X11_ERR_GCONTEXT, gc_xid, opcode, 0u);
+            break;
+        }
+        if (!gc->graphics_exposure) {
+            uint8_t evt[32];
+            x11_build_no_expose(evt, dst_draw, 0u, opcode, seq,
+                                c->byte_order);
+            (void)x11_client_send_event(c,
+                                        (const struct x11_event_32 *)evt);
+        }
+        xc_log("info",
+               "CopyArea: src=0x%x dst=0x%x gc=0x%x (no-op, ge=%d)",
+               (unsigned)src_draw, (unsigned)dst_draw,
+               (unsigned)gc_xid, (int)gc->graphics_exposure);
+        break;
+    }
+    case X11_REQ_POLY_FILL_RECTANGLE: {
+        /* PolyFillRectangle payload: 4 drawable, 4 gc, then n
+         * rectangles each 8 bytes (2x, 2y, 2w, 2h). Total = 8 +
+         * n*8 bytes payload. No reply. v1: accept and discard; the
+         * bridge does no vector rendering. */
+        if (total < 12) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t draw   = x11_get_u32(buf + 4, c->byte_order);
+        uint32_t gc_xid = x11_get_u32(buf + 8, c->byte_order);
+        if (x11_client_check_drawable(c, draw) == 0) {
+            x11_client_send_error(c, X11_ERR_DRAWABLE, draw, opcode, 0u);
+            break;
+        }
+        if (x11_client_find_gc(c, gc_xid) == NULL) {
+            x11_client_send_error(c, X11_ERR_GCONTEXT, gc_xid, opcode, 0u);
+            break;
+        }
+        size_t payload_len = total - 4u;
+        size_t nrects = (payload_len > 8u) ? (payload_len - 8u) / 8u : 0u;
+        xc_log("info",
+               "PolyFillRectangle: drawable=0x%x gc=0x%x rects=%zu (no-op)",
+               (unsigned)draw, (unsigned)gc_xid, nrects);
+        break;
+    }
+    case X11_REQ_GET_IMAGE: {
+        /* GetImage payload: 1 format (header byte 1 = data), 4
+         * drawable, 2 x, 2 y, 2 width, 2 height, 4 plane-mask.
+         * Total 20 bytes. Reply: 32-byte header (code, depth, seq,
+         * length, visual, 20 bytes pad) then width*height*bpp/8
+         * bytes of image data, padded to 4. v1: for a window with a
+         * ZPixmap depth-24 backing image, return the backing image
+         * rect; elsewhere return zeros. */
+        uint8_t format = data;
+        if (format > 2u) {
+            x11_client_send_error(c, X11_ERR_VALUE, (uint32_t)format,
+                                  opcode, 0u);
+            break;
+        }
+        if (total < 20) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t draw = x11_get_u32(buf + 4,  c->byte_order);
+        int16_t  x    = (int16_t)x11_get_u16(buf + 8,  c->byte_order);
+        int16_t  y    = (int16_t)x11_get_u16(buf + 10, c->byte_order);
+        uint16_t w    = x11_get_u16(buf + 12, c->byte_order);
+        uint16_t h    = x11_get_u16(buf + 14, c->byte_order);
+        /* plane_mask at buf + 16; ignored in v1 (all planes returned). */
+
+        uint8_t  depth  = 24u;
+        uint32_t visual = X11_ROOT_VISUAL_ID;
+        struct x11_window *win = NULL;
+        if (draw == X11_ROOT_WINDOW_ID) {
+            depth = 24u;
+        } else {
+            win = x11_client_find_window(c, draw);
+            if (win != NULL) {
+                depth  = (win->depth == 0u) ? 24u : win->depth;
+                visual = (win->visual_id == 0u)
+                          ? X11_ROOT_VISUAL_ID : win->visual_id;
+            } else {
+                struct x11_pixmap *pix = x11_client_find_pixmap(c, draw);
+                if (pix == NULL) {
+                    x11_client_send_error(c, X11_ERR_DRAWABLE, draw,
+                                          opcode, 0u);
+                    break;
+                }
+                depth = pix->depth;
+            }
+        }
+
+        /* v1 assumes ZPixmap depth 24 (4 bpp) for the data size.
+         * Other depths return zeros of the same computed size; the
+         * test only uses depth 24. */
+        size_t bpp = 4u;
+        size_t data_bytes = (size_t)w * (size_t)h * bpp;
+        size_t padded = x11_pad4(data_bytes);
+        size_t reply_len = 32u + padded;
+
+        uint8_t *reply = malloc(reply_len);
+        if (reply == NULL) {
+            x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+            break;
+        }
+        memset(reply, 0, reply_len);
+        reply[0] = 1u;  /* reply */
+        reply[1] = depth;
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        x11_put_u32(reply + 4, (uint32_t)(padded / 4u), c->byte_order);
+        x11_put_u32(reply + 8, visual, c->byte_order);
+        /* bytes 12..31: pad, already zeroed. */
+
+        if (win != NULL && win->backing_image != NULL &&
+            win->backing_image_format == X11_IMAGE_FORMAT_ZPIXMAP &&
+            win->backing_image_depth == 24u &&
+            format == X11_IMAGE_FORMAT_ZPIXMAP) {
+            int32_t bw = (int32_t)win->backing_image_w;
+            int32_t bh = (int32_t)win->backing_image_h;
+            for (int32_t row = 0; row < (int32_t)h; row++) {
+                int32_t py = (int32_t)y + row;
+                if (py < 0 || py >= bh) continue;
+                for (int32_t col = 0; col < (int32_t)w; col++) {
+                    int32_t px = (int32_t)x + col;
+                    if (px < 0 || px >= bw) continue;
+                    size_t src_off = ((size_t)py * (size_t)bw + (size_t)px) * 4u;
+                    size_t dst_off = 32u + ((size_t)row * (size_t)w + (size_t)col) * 4u;
+                    if (src_off + 4u > win->backing_image_len) continue;
+                    if (dst_off + 4u > reply_len) continue;
+                    memcpy(reply + dst_off,
+                           win->backing_image + src_off, 4u);
+                }
+            }
+        }
+
+        xc_log("info",
+               "GetImage: drawable=0x%x fmt=%u rect=(%d,%d,%ux%u) -> %zu bytes",
+               (unsigned)draw, (unsigned)format, (int)x, (int)y,
+               (unsigned)w, (unsigned)h, data_bytes);
+        int rc = x11_client_send_raw(c, reply, reply_len);
+        free(reply);
+        if (rc < 0) return -1;
+        break;
+    }
     case 53: {  /* CreatePixmap */
         /* CreatePixmap payload: 1 depth (header byte 1), 4 pid, 4
          * drawable, 2 width, 2 height. Total 16 bytes. No reply. */
@@ -1775,6 +2056,210 @@ static int x11_client_dispatch_request(struct x11_client *c,
             break;
         }
         pix->in_use = false;
+        break;
+    }
+    case X11_REQ_CREATE_COLORMAP: {  /* 78 */
+        /* CreateColormap payload (after the 4-byte header):
+         *   1 alloc (header byte 1 = data: 0 AllocNone, 1 AllocAll)
+         *   4 colormap XID (client-allocated)
+         *   4 window
+         *   4 visual
+         * Total 12 bytes payload = 16 bytes request. No reply. */
+        if (total < 16u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint8_t  alloc  = data;
+        uint32_t cmap   = x11_get_u32(buf + 4, c->byte_order);
+        uint32_t win_x  = x11_get_u32(buf + 8, c->byte_order);
+        uint32_t visual = x11_get_u32(buf + 12, c->byte_order);
+        if (alloc > 1u) {
+            x11_client_send_error(c, X11_ERR_VALUE, (uint32_t)alloc,
+                                  opcode, 0u);
+            break;
+        }
+        if (win_x != X11_ROOT_WINDOW_ID &&
+            x11_client_find_window(c, win_x) == NULL) {
+            x11_client_send_error(c, X11_ERR_WINDOW, win_x, opcode, 0u);
+            break;
+        }
+        if (x11_client_find_colormap(c, cmap) != NULL) {
+            x11_client_send_error(c, X11_ERR_IDCHOICE, cmap, opcode, 0u);
+            break;
+        }
+        struct x11_colormap *cm = x11_client_alloc_colormap(c, cmap);
+        if (cm == NULL) {
+            x11_client_send_error(c, X11_ERR_ALLOC, 0u, opcode, 0u);
+            break;
+        }
+        cm->window_xid = win_x;
+        cm->visual_id  = visual;
+        cm->alloc_flag = alloc;
+        xc_log("info",
+               "CreateColormap: cmap=0x%x window=0x%x visual=0x%x alloc=%u",
+               (unsigned)cmap, (unsigned)win_x, (unsigned)visual,
+               (unsigned)alloc);
+        break;
+    }
+    case X11_REQ_FREE_COLORMAP: {  /* 79 */
+        /* FreeColormap payload: 4 colormap. Total 8 bytes. No reply.
+         * Look up the colormap; mark its slot free. BadColormap if
+         * not tracked. */
+        if (total < 8u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t cmap = x11_get_u32(buf + 4, c->byte_order);
+        struct x11_colormap *cm = x11_client_find_colormap(c, cmap);
+        if (cm == NULL) {
+            x11_client_send_error(c, X11_ERR_COLORMAP, cmap, opcode, 0u);
+            break;
+        }
+        cm->in_use = false;
+        xc_log("info", "FreeColormap: cmap=0x%x", (unsigned)cmap);
+        break;
+    }
+    case X11_REQ_ALLOC_COLOR: {  /* 84 */
+        /* AllocColor payload (after the 4-byte header):
+         *   4 colormap
+         *   2 red
+         *   2 green
+         *   2 blue
+         *   2 unused
+         * Total 12 bytes payload = 16 bytes request. Reply is 32 bytes.
+         * v1 headless: echo back the requested RGB and return
+         * pixel = 0x00RRGGBB. The bridge does no real allocation. */
+        if (total < 16u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t cmap = x11_get_u32(buf + 4, c->byte_order);
+        uint16_t r    = x11_get_u16(buf + 8,  c->byte_order);
+        uint16_t g    = x11_get_u16(buf + 10, c->byte_order);
+        uint16_t b    = x11_get_u16(buf + 12, c->byte_order);
+        if (x11_client_find_colormap(c, cmap) == NULL) {
+            x11_client_send_error(c, X11_ERR_COLORMAP, cmap, opcode, 0u);
+            break;
+        }
+        uint32_t pixel = ((uint32_t)(r & 0xFFu) << 16) |
+                         ((uint32_t)(g & 0xFFu) << 8)  |
+                          (uint32_t)(b & 0xFFu);
+        uint8_t reply[32];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 1u;  /* reply indicator */
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        x11_put_u32(reply + 4, 0u, c->byte_order);  /* reply length */
+        x11_put_u16(reply + 8,  r, c->byte_order);
+        x11_put_u16(reply + 10, g, c->byte_order);
+        x11_put_u16(reply + 12, b, c->byte_order);
+        /* bytes 14..15 pad */
+        x11_put_u32(reply + 16, pixel, c->byte_order);
+        xc_log("info",
+               "AllocColor: cmap=0x%x rgb=(%u,%u,%u) -> pixel=0x%x",
+               (unsigned)cmap, (unsigned)r, (unsigned)g, (unsigned)b,
+               (unsigned)pixel);
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_QUERY_COLORS: {  /* 91 */
+        /* QueryColors payload (after the 4-byte header):
+         *   4 colormap
+         *   n pixels (each 4 bytes)
+         * Total = 4 + n*4 bytes payload = 8 + n*4 bytes request.
+         * Reply: 32 bytes header + n*8 bytes (each color is
+         *   2 red, 2 green, 2 blue, 2 pad).
+         * v1: unpack each pixel as 0x00RRGGBB. Works for 24-bit
+         * TrueColor visuals (the only visual the bridge advertises). */
+        if (total < 8u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t cmap = x11_get_u32(buf + 4, c->byte_order);
+        if (x11_client_find_colormap(c, cmap) == NULL) {
+            x11_client_send_error(c, X11_ERR_COLORMAP, cmap, opcode, 0u);
+            break;
+        }
+        size_t pixel_bytes = (total > 8u) ? total - 8u : 0u;
+        size_t n = pixel_bytes / 4u;
+        /* Cap n so the reply buffer fits. 256 colors = 2048 bytes of
+         * color data, plenty for any v1 client. */
+        if (n > 256u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint16_t n16 = (uint16_t)n;
+        uint8_t reply[32u + 256u * 8u];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 1u;  /* reply indicator */
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        /* reply length = additional 4-byte units after first 32 bytes
+         * = (n * 8) / 4 = 2 * n. */
+        x11_put_u32(reply + 4, (uint32_t)(2u * n), c->byte_order);
+        x11_put_u16(reply + 8, n16, c->byte_order);
+        /* bytes 10..31 pad */
+        for (uint16_t i = 0; i < n16; i++) {
+            uint32_t px = x11_get_u32(buf + 8u + (size_t)i * 4u,
+                                      c->byte_order);
+            uint16_t r = (uint16_t)((px >> 16) & 0xFFu);
+            uint16_t g = (uint16_t)((px >> 8)  & 0xFFu);
+            uint16_t b = (uint16_t)(px        & 0xFFu);
+            size_t off = 32u + (size_t)i * 8u;
+            x11_put_u16(reply + off,     r, c->byte_order);
+            x11_put_u16(reply + off + 2, g, c->byte_order);
+            x11_put_u16(reply + off + 4, b, c->byte_order);
+            /* bytes off+6..off+7 pad */
+        }
+        xc_log("info", "QueryColors: cmap=0x%x n=%u",
+               (unsigned)cmap, (unsigned)n16);
+        if (x11_client_send_raw(c, reply, 32u + (size_t)n16 * 8u) < 0) {
+            return -1;
+        }
+        break;
+    }
+    case X11_REQ_LOOKUP_COLOR: {  /* 92 */
+        /* LookupColor payload (after the 4-byte header):
+         *   4 colormap
+         *   2 name_len
+         *   2 unused
+         *   name (padded to 4)
+         * Total = 12 + pad4(name_len) bytes request. Reply is 32 bytes.
+         * v1: the bridge ships no Xrgb.txt. Return exact RGB =
+         * screen RGB = (0, 0, 0) for every name. Wrong but does not
+         * crash; clients that need real color lookup get black. */
+        if (total < 12u) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint32_t cmap     = x11_get_u32(buf + 4, c->byte_order);
+        uint16_t name_len = x11_get_u16(buf + 8, c->byte_order);
+        if (x11_client_find_colormap(c, cmap) == NULL) {
+            x11_client_send_error(c, X11_ERR_COLORMAP, cmap, opcode, 0u);
+            break;
+        }
+        if (name_len == 0u) {
+            x11_client_send_error(c, X11_ERR_VALUE, 0u, opcode, 0u);
+            break;
+        }
+        size_t name_padded = (size_t)((name_len + 3u) & ~3u);
+        if (total < 12u + name_padded) {
+            x11_client_send_error(c, X11_ERR_LENGTH, 0u, opcode, 0u);
+            break;
+        }
+        uint8_t reply[32];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 1u;  /* reply indicator */
+        x11_put_u16(reply + 2, seq, c->byte_order);
+        x11_put_u32(reply + 4, 0u, c->byte_order);  /* reply length */
+        /* exact-red, exact-green, exact-blue at 8, 10, 12 */
+        /* screen-red, screen-green, screen-blue at 14, 16, 18 */
+        /* All zero: black. */
+        xc_log("info", "LookupColor: cmap=0x%x name_len=%u -> black",
+               (unsigned)cmap, (unsigned)name_len);
+        if (x11_client_send_raw(c, reply, sizeof(reply)) < 0) {
+            return -1;
+        }
         break;
     }
     case 98: {  /* QueryExtension */

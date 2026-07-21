@@ -11,13 +11,19 @@
  * incomplete requests, and a small table mapping X11 window ids to
  * bridge-tracked window state.
  *
- * W9-B: the bridge now handles twenty core opcodes end-to-end. The
+ * W9-B: the bridge handles twenty core opcodes end-to-end. The
  * ten W8-A opcodes plus GetWindowAttributes, QueryTree, GetAtomName,
  * DeleteProperty, SetSelectionOwner, GetSelectionOwner, QueryPointer,
  * SetInputFocus, CreateGC, PutImage. Per-client state gained a
  * graphics-context table (CreateGC), a selection-ownership table
  * (SetSelectionOwner), keyboard focus state (SetInputFocus), and a
- * per-window PutImage backing store. */
+ * per-window PutImage backing store.
+ *
+ * W10-B: five colormap opcodes added (CreateColormap, FreeColormap,
+ * AllocColor, QueryColors, LookupColor). Per-client state gained a
+ * colormap table. The bridge does no real color allocation; AllocColor
+ * echoes the requested RGB and returns a packed pixel, QueryColors
+ * unpacks each pixel as 0x00RRGGBB, and LookupColor returns black. */
 
 #ifndef X11_CLIENT_H
 #define X11_CLIENT_H
@@ -35,6 +41,7 @@
 #define X11_CLIENT_MAX_PIX    32   /* pixmaps tracked per client */
 #define X11_CLIENT_MAX_GCS    32   /* graphics contexts per client */
 #define X11_CLIENT_MAX_SELS   8    /* selection ownerships per client */
+#define X11_CLIENT_MAX_CMAPS  16   /* colormaps tracked per client */
 #define X11_PUT_IMAGE_MAX_BYTES  (64u * 1024u)  /* per-PutImage data cap */
 
 /* Per-window property: (property atom, type atom, format, value bytes).
@@ -73,12 +80,17 @@ struct x11_window {
      * follow X11: bit_gravity=Forget(0), win_gravity=NorthWest(1),
      * backing_store=NotUseful(0), backing_planes=AllPlanes(~0),
      * backing_pixel=0, save_under=false, colormap=0
-     * (CopyFromParent), do_not_propagate_mask=0. */
+     * (CopyFromParent), do_not_propagate_mask=0.
+     *
+     * W10-A: background_pixel (CW_BG_PIXEL) is tracked so ClearArea
+     * can paint with it. Defaults to 0 (black), matching the X11
+     * spec when the client sets no background. */
     uint8_t   bit_gravity;
     uint8_t   win_gravity;
     uint8_t   backing_store;
     uint32_t  backing_planes;
     uint32_t  backing_pixel;
+    uint32_t  background_pixel;
     uint32_t  colormap;
     bool      save_under;
     uint16_t  do_not_propagate_mask;
@@ -145,6 +157,20 @@ struct x11_pixmap {
     uint8_t   depth;
 };
 
+/* W10-B: per-client colormap. Created by CreateColormap (78). The
+ * bridge does no real color allocation; AllocColor and QueryColors
+ * echo back the requested values, and LookupColor returns black for
+ * every name. visual_id is stored for GetWindowAttributes parity but
+ * the bridge does not enforce that AllocColor targets the right
+ * visual. alloc_flag is 0 (AllocNone) or 1 (AllocAll). */
+struct x11_colormap {
+    bool      in_use;
+    uint32_t  colormap_xid;   /* client-allocated XID */
+    uint32_t  window_xid;     /* window passed to CreateColormap */
+    uint32_t  visual_id;
+    uint8_t   alloc_flag;     /* X11_ALLOC_NONE or X11_ALLOC_ALL */
+};
+
 struct x11_client {
     int      fd;
     bool     setup_done;          /* setup_request received, success sent */
@@ -182,6 +208,13 @@ struct x11_client {
      * bridge has no inter-client event delivery today. A future
      * multi-client wave will hoist this into a process-global table. */
     struct x11_selection selections[X11_CLIENT_MAX_SELS];
+
+    /* W10-B: colormap table. Keyed by client-allocated colormap XID.
+     * The bridge does no real color allocation; the table exists so
+     * AllocColor / QueryColors / LookupColor / FreeColormap can
+     * validate the colormap XID and reject unknown ones with
+     * BadColormap. */
+    struct x11_colormap colormaps[X11_CLIENT_MAX_CMAPS];
 
     /* W9-B: keyboard focus state, set by SetInputFocus (42). The
      * bridge translates focus to ISZ_MSG_SEAT_SET_KEYBOARD_FOCUS.

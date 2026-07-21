@@ -674,3 +674,33 @@ size_t x11_build_no_expose(uint8_t *out_buf,
     out_buf[10] = major_opcode;
     return 32;
 }
+
+/* Expose (event type 12) wire layout:
+ *   0   CARD8 code (12)
+ *   1   unused
+ *   2   CARD16 sequence
+ *   4   WINDOW window
+ *   8   CARD16 x
+ *   10  CARD16 y
+ *   12  CARD16 width
+ *   14  CARD16 height
+ *   16  CARD16 count
+ *   18..31 unused */
+size_t x11_build_expose(uint8_t *out_buf,
+                        uint32_t window,
+                        uint16_t x, uint16_t y,
+                        uint16_t width, uint16_t height,
+                        uint16_t count,
+                        uint16_t sequence, uint8_t byte_order) {
+    if (out_buf == NULL) return 0;
+    memset(out_buf, 0, 32);
+    out_buf[0] = X11_EV_EXPOSE;
+    x11_put_u16(out_buf + 2, sequence, byte_order);
+    x11_put_u32(out_buf + 4, window, byte_order);
+    x11_put_u16(out_buf + 8,  x, byte_order);
+    x11_put_u16(out_buf + 10, y, byte_order);
+    x11_put_u16(out_buf + 12, width, byte_order);
+    x11_put_u16(out_buf + 14, height, byte_order);
+    x11_put_u16(out_buf + 16, count, byte_order);
+    return 32;
+}
