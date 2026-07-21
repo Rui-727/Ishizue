@@ -554,6 +554,50 @@ static int open_primary_drm_node(struct isz_drm_state *st)
 /* Backend ops                                                        */
 /* ------------------------------------------------------------------ */
 
+#ifdef ISHIZUE_HAVE_LIBSEAT
+/* libseat seat listener. disable_seat fires when the kernel requests
+ * a VT switch (another TTY is activated). We must call drmDropMaster
+ * here so the kernel releases the CRTC for the new VT. enable_seat
+ * fires on switch-back; we re-acquire master.
+ *
+ * Without these callbacks the kernel blocks VT switches because DRM
+ * master is still held. The user sees tinyisz frozen on the TTY
+ * until Ctrl+C kills it. */
+static void drm_disable_seat(struct libseat *seat, void *userdata) {
+    (void)seat;
+    struct isz_drm_state *st = userdata;
+    if (!st || st->drm_fd < 0) return;
+    st->session_active = false;
+    isz_log_internal(ISZ_LOG_INFO, "drm: VT switch away, dropping master");
+    if (drmDropMaster(st->drm_fd) != 0) {
+        isz_log_internal(ISZ_LOG_WARN, "drm: drmDropMaster failed: %s",
+                         strerror(errno));
+    }
+    /* Acknowledge the VT switch so the kernel can proceed. libseat
+     * requires this; without it the switch hangs. */
+    libseat_disable_seat(st->seat);
+}
+
+static void drm_enable_seat(struct libseat *seat, void *userdata) {
+    (void)seat;
+    struct isz_drm_state *st = userdata;
+    if (!st || st->drm_fd < 0) return;
+    isz_log_internal(ISZ_LOG_INFO, "drm: VT switch back, acquiring master");
+    if (drmSetMaster(st->drm_fd) != 0) {
+        isz_log_internal(ISZ_LOG_ERROR, "drm: drmSetMaster failed: %s",
+                         strerror(errno));
+        isz_backend_set_error(st->backend, ISZ_ERR_DRM_MASTER);
+        return;
+    }
+    st->session_active = true;
+}
+
+static const struct libseat_seat_listener drm_seat_listener = {
+    .enable_seat  = drm_enable_seat,
+    .disable_seat = drm_disable_seat,
+};
+#endif
+
 static int isz_drm_init(struct isz_backend *self, void *config)
 {
     (void)config;
@@ -570,12 +614,15 @@ static int isz_drm_init(struct isz_backend *self, void *config)
 #ifdef ISHIZUE_HAVE_LIBSEAT
     /* Open a libseat session so drmDropMaster / drmSetMaster on VT
      * switch work without us hand-rolling logind/seatd/direct. If
-     * libseat_open_seat fails we fall through to a direct open. */
-    st->seat = libseat_open_seat(NULL, st);
+     * libseat_open_seat fails we fall through to a direct open.
+     *
+     * The seat listener is mandatory: without disable_seat, the kernel
+     * blocks VT switches because drmDropMaster is never called. */
+    st->seat = libseat_open_seat(&drm_seat_listener, st);
     if (st->seat) {
         /* libseat requires dispatch to surface enable_seat. We do one
-         * non-blocking drain here; the input layer's session loop
-         * takes over from there. */
+         * non-blocking drain here; the main dispatch loop drains the
+         * seat fd on every isz_dispatch call via isz_drm_dispatch. */
         (void)libseat_dispatch(st->seat, 0);
     }
 #endif
@@ -714,6 +761,19 @@ static int isz_drm_read_events(struct isz_backend *self)
     struct isz_drm_state *st = self->impl;
     if (!st || st->drm_fd < 0)
         return ISZ_ERR_FEATURE_UNAVAIL;
+
+    /* Drain the libseat session. enable_seat / disable_seat fire
+     * inline here, triggering drmDropMaster / drmSetMaster on VT
+     * switches. Without this the seat fd is never drained and VT
+     * switches hang. */
+#ifdef ISHIZUE_HAVE_LIBSEAT
+    if (st->seat) {
+        while (libseat_dispatch(st->seat, 0) > 0) {
+            /* keep draining */
+        }
+    }
+#endif
+
     return isz_drm_event_dispatch(st, self);
 }
 
