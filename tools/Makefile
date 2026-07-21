@@ -6,8 +6,11 @@ LDFLAGS ?= -L.. -lishizue -Wl,-rpath,$(shell pwd)/..
 
 all: isz_compositor
 
-isz_compositor: isz_compositor.c
+isz_compositor: isz_compositor.c ../libishizue.so
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+../libishizue.so:
+	@$(MAKE) -C .. libishizue.so
 
 clean:
 	rm -f isz_compositor

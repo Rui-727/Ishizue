@@ -61,11 +61,11 @@ TEST7_SRC := tests/test_x11_cursor.c
 .PHONY: all clean test
 all: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN) $(TEST6_BIN) $(TEST7_BIN)
 
-$(BIN): $(OBJS)
+$(BIN): $(OBJS) ../libishizue.so
 	@if [ ! -f ../libishizue.so ] && [ "$(BRIDGE_LDLIBS)" = "-L.. -lishizue" ]; then \
-		echo "x11bridge: ../libishizue.so not found." >&2; \
-		echo "  Build the library first: make -C .." >&2; \
-		exit 1; \
+	        echo "x11bridge: ../libishizue.so not found." >&2; \
+	        echo "  Build the library first: make -C .." >&2; \
+	        exit 1; \
 	fi
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(BRIDGE_LDLIBS)
 
@@ -84,42 +84,44 @@ $(BUILD_DIR)/%.o: ../src/protocol/%.c | $(BUILD_DIR)
 # Test binaries: built from tests/*.c, linked against libishizue.so
 # (public API only). They do NOT link bridge objects; the tests
 # spawn the bridge as a subprocess.
-$(TEST_BIN): $(TEST_SRC)
+# Depend on ../libishizue.so so parallel builds don't link against
+# a stale .so.
+$(TEST_BIN): $(TEST_SRC) ../libishizue.so
 	@mkdir -p tests
 	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
-		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+	        $(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
 
 # W8-A integration test: exercises MapWindow, UnmapWindow,
 # ChangeWindowAttributes, ConfigureWindow, DestroyWindow, InternAtom,
 # ChangeProperty, GetProperty.
-$(TEST2_BIN): $(TEST2_SRC)
+$(TEST2_BIN): $(TEST2_SRC) ../libishizue.so
 	@mkdir -p tests
 	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
-		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+	        $(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
 
 # W9-B integration test: exercises GetWindowAttributes, QueryTree,
 # GetAtomName, DeleteProperty, SetSelectionOwner, GetSelectionOwner,
 # QueryPointer, SetInputFocus, CreateGC, PutImage.
-$(TEST3_BIN): $(TEST3_SRC)
+$(TEST3_BIN): $(TEST3_SRC) ../libishizue.so
 	@mkdir -p tests
 	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
-		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+	        $(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
 
 # W10-B integration test: exercises CreateColormap, FreeColormap,
 # AllocColor, QueryColors, LookupColor on the headless backend.
-$(TEST4_BIN): $(TEST4_SRC)
+$(TEST4_BIN): $(TEST4_SRC) ../libishizue.so
 	@mkdir -p tests
 	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
-		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+	        $(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
 
 # W10-A integration test: exercises FreeGC, ClearArea, CopyArea,
 # PolyFillRectangle, GetImage on the headless backend. Verifies that
 # GetImage returns the bytes PutImage stashed, and that ClearArea
 # zeroes the cleared rect in the backing image.
-$(TEST5_BIN): $(TEST5_SRC)
+$(TEST5_BIN): $(TEST5_SRC) ../libishizue.so
 	@mkdir -p tests
 	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
-		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+	        $(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
 
 # W11-A integration test: exercises OpenFont, CloseFont, QueryFont,
 # QueryTextExtents, ListFonts, ListFontsWithInfo, SetFontPath,
@@ -127,10 +129,10 @@ $(TEST5_BIN): $(TEST5_SRC)
 # that QueryFont / QueryTextExtents / ListFontsWithInfo return
 # zeroed-metrics replies, ListFonts / GetFontPath return empty lists,
 # and CloseFont on an unknown XID is a silent no-op.
-$(TEST6_BIN): $(TEST6_SRC)
+$(TEST6_BIN): $(TEST6_SRC) ../libishizue.so
 	@mkdir -p tests
 	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
-		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+	        $(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
 
 # W11-B integration test: exercises CreatePixmap (for cursor source),
 # CreateCursor, RecolorCursor, QueryBestSize, FreeCursor (twice for
@@ -138,42 +140,42 @@ $(TEST6_BIN): $(TEST6_SRC)
 # headless backend. Verifies that QueryBestSize echoes the requested
 # 16x16 size and that FreeCursor on an already-freed cursor returns
 # BadCursor.
-$(TEST7_BIN): $(TEST7_SRC)
+$(TEST7_BIN): $(TEST7_SRC) ../libishizue.so
 	@mkdir -p tests
 	$(CC) $(CFLAGS) -I../include $(LDFLAGS) -o $@ $< \
-		$(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
+	        $(TEST_LDLIBS) -Wl,-rpath,$(TEST_RPATH)
 
 # Build + run the integration tests. Runs from the repo root so the
 # default bridge binary path (x11bridge/x11bridge) resolves.
 test: $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN) $(TEST6_BIN) $(TEST7_BIN)
 	@cd .. && \
-		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
-		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
-		./x11bridge/tests/test_x11_handshake
+	        ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+	        LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+	        ./x11bridge/tests/test_x11_handshake
 	@cd .. && \
-		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
-		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
-		./x11bridge/tests/test_x11_opcodes
+	        ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+	        LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+	        ./x11bridge/tests/test_x11_opcodes
 	@cd .. && \
-		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
-		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
-		./x11bridge/tests/test_x11_opcodes2
+	        ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+	        LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+	        ./x11bridge/tests/test_x11_opcodes2
 	@cd .. && \
-		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
-		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
-		./x11bridge/tests/test_x11_colormap
+	        ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+	        LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+	        ./x11bridge/tests/test_x11_colormap
 	@cd .. && \
-		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
-		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
-		./x11bridge/tests/test_x11_render
+	        ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+	        LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+	        ./x11bridge/tests/test_x11_render
 	@cd .. && \
-		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
-		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
-		./x11bridge/tests/test_x11_fonts
+	        ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+	        LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+	        ./x11bridge/tests/test_x11_fonts
 	@cd .. && \
-		ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
-		LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
-		./x11bridge/tests/test_x11_cursor
+	        ISZ_X11BRIDGE_BIN=x11bridge/x11bridge \
+	        LD_LIBRARY_PATH=$(TEST_RPATH):$$LD_LIBRARY_PATH \
+	        ./x11bridge/tests/test_x11_cursor
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN) $(TEST_BIN) $(TEST2_BIN) $(TEST3_BIN) $(TEST4_BIN) $(TEST5_BIN) $(TEST6_BIN) $(TEST7_BIN)

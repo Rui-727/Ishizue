@@ -83,8 +83,9 @@ INCLUDEDIR ?= $(PREFIX)/include
 .PHONY: all clean install uninstall test check
 all: $(LIB_NAME) $(LIB_SONAME) $(LIB_LINK) all-bin
 
-# Build the binaries that depend on the library.
-all-bin:
+# Build the binaries that depend on the library. Depends on the .so
+# so parallel builds don't start the sub-makes before the .so exists.
+all-bin: $(LIB_NAME)
 	@$(MAKE) -C x11bridge
 	@$(MAKE) -C tinyisz
 	@$(MAKE) -C tools
