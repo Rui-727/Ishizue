@@ -433,7 +433,7 @@ int isz_drm_atomic_commit(struct isz_drm_state *st,
                  * advertised by the driver. */
                 if (st->syncobj_supported &&
                     buf->in_syncobj != 0 &&
-                    cache->plane_in_fence_id != 0) {
+                    cache->plane_in_fence_fd != 0) {
                     in_fence_fd = isz_syncobj_export_sync_file(st->drm_fd,
                                                                buf->in_syncobj);
                     if (in_fence_fd >= 0) {

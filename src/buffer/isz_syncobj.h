@@ -19,6 +19,7 @@
 #ifndef ISZ_SYNCOBJ_H
 #define ISZ_SYNCOBJ_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "../util/isz_compiler.h"

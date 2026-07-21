@@ -67,6 +67,12 @@
  * SetFontPath, GetFontPath, PolyText8, PolyText16, ImageText8,
  * ImageText16. W11-B adds five cursor / misc opcodes: CreateCursor,
  * CreateGlyphCursor, FreeCursor, RecolorCursor, QueryBestSize.
+ * W12-B adds ten keyboard / pointer / screen-saver opcodes:
+ * ChangeKeyboardMapping, GetKeyboardMapping, ChangeKeyboardControl,
+ * GetKeyboardControl, Bell, ChangePointerControl, GetPointerControl,
+ * SetScreenSaver, GetScreenSaver, GetModifierMapping. W12-B also
+ * moves NoOperation from 119 (where the scaffold put it) to 127,
+ * its canonical X11 number; GetModifierMapping takes 119.
  * Other opcodes the scaffold must accept (QueryExtension,
  * GetInputFocus, ...) stay in the no-op default branch; see
  * x11_client.c. */

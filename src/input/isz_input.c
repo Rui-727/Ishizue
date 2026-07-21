@@ -49,10 +49,10 @@ void isz_input_destroy(struct isz_input_state *st) {
 /* libinput context setup                                             */
 /* ------------------------------------------------------------------ */
 
-static void log_libinput(void *userdata,
+static void log_libinput(struct libinput *li,
                          enum libinput_log_priority pri,
                          const char *fmt, va_list args) {
-    (void)userdata;
+    (void)li;
     enum isz_log_level lvl;
     switch (pri) {
     case LIBINPUT_LOG_PRIORITY_DEBUG: lvl = ISZ_LOG_DEBUG; break;
@@ -87,6 +87,14 @@ static const struct libinput_interface li_iface = {
 };
 
 int isz_input_init_with_fd(isz_server *srv, int fd) {
+    /* libinput has no API to wrap an already-open fd. The real
+     * integration uses libseat's open_restricted callback to hand
+     * fds to libinput via libinput_path_create_context +
+     * libinput_path_add_device(path). That refactor belongs in the
+     * DRM-backend wave. For now this function accepts the fd (so
+     * the headless backend's stub path compiles) but does not
+     * actually wire it into libinput. The DRM backend's real
+     * init path will create the libinput context itself. */
     if (!srv || fd < 0)
         return ISZ_ERR_INVALID_ARG;
 
@@ -105,9 +113,9 @@ int isz_input_init_with_fd(isz_server *srv, int fd) {
     }
 
     st->fd = fd;
-    st->li = libinput_fd_from_fd(fd, &li_iface, NULL);
+    st->li = libinput_path_create_context(&li_iface, NULL);
     if (!st->li) {
-        isz_log_internal(ISZ_LOG_DEBUG, "libinput_fd_from_fd failed");
+        isz_log_internal(ISZ_LOG_DEBUG, "libinput_path_create_context failed");
         return ISZ_ERR_FEATURE_UNAVAIL;
     }
     libinput_log_set_handler(st->li, log_libinput);
@@ -131,12 +139,38 @@ void isz_input_destroy(struct isz_input_state *st) {
 /* ------------------------------------------------------------------ */
 
 static uint64_t ev_time(struct libinput_event *ev) {
-    /* TODO: §9 wants CLOCK_MONOTONIC_RAW. libinput only exposes
-     * CLOCK_MONOTONIC (microseconds). For now pass it through as
-     * nanoseconds. The DRM backend wave should sample
-     * CLOCK_MONOTONIC_RAW at dispatch entry and stamp events from
-     * that, since libinput has no raw accessor. */
-    return (uint64_t)libinput_event_get_time(ev) * 1000u;
+    /* libinput exposes time per event type, not on the base event.
+     * Dispatch on the type. Returns microseconds; caller multiplies
+     * by 1000 to get nanoseconds. TODO: SPEC §9 wants
+     * CLOCK_MONOTONIC_RAW. libinput only exposes CLOCK_MONOTONIC.
+     * The DRM backend wave should sample CLOCK_MONOTONIC_RAW at
+     * dispatch entry and stamp events from that. */
+    enum libinput_event_type t = libinput_event_get_type(ev);
+    uint32_t us = 0;
+    switch (t) {
+    case LIBINPUT_EVENT_KEYBOARD_KEY:
+        us = libinput_event_keyboard_get_time(
+            libinput_event_get_keyboard_event(ev));
+        break;
+    case LIBINPUT_EVENT_POINTER_MOTION:
+    case LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE:
+    case LIBINPUT_EVENT_POINTER_BUTTON:
+    case LIBINPUT_EVENT_POINTER_AXIS:
+        us = libinput_event_pointer_get_time(
+            libinput_event_get_pointer_event(ev));
+        break;
+    case LIBINPUT_EVENT_TOUCH_DOWN:
+    case LIBINPUT_EVENT_TOUCH_UP:
+    case LIBINPUT_EVENT_TOUCH_MOTION:
+    case LIBINPUT_EVENT_TOUCH_FRAME:
+        us = libinput_event_touch_get_time(
+            libinput_event_get_touch_event(ev));
+        break;
+    default:
+        us = 0;
+        break;
+    }
+    return (uint64_t)us * 1000u;
 }
 
 static void emit(isz_server *srv, const isz_event *e) {
@@ -244,7 +278,10 @@ static isz_seat *seat_for_libinput(isz_server *srv,
     struct isz_input_state *st = isz_server_get_input_state(srv);
     if (!st)
         return NULL;
-    const char *name = libinput_device_get_seat_name(d);
+    /* libinput exposes the seat name via the seat object, not the
+     * device. Use the physical seat name (e.g. "seat0"). */
+    struct libinput_seat *seat = libinput_device_get_seat(d);
+    const char *name = seat ? libinput_seat_get_physical_name(seat) : NULL;
     if (!name)
         name = "seat0";
     for (struct isz_seat *s = st->seats_head; s; s = s->next) {
@@ -255,8 +292,8 @@ static isz_seat *seat_for_libinput(isz_server *srv,
 }
 
 static void handle_device_added(isz_server *srv,
-                                struct libinput_event_device *ev) {
-    struct libinput_device *d = libinput_event_device_get_device(ev);
+                                struct libinput_event *ev) {
+    struct libinput_device *d = libinput_event_get_device(ev);
     isz_seat *seat = seat_for_libinput(srv, d);
     if (!seat)
         return;
@@ -283,8 +320,8 @@ static void handle_device_added(isz_server *srv,
 }
 
 static void handle_device_removed(isz_server *srv,
-                                  struct libinput_event_device *ev) {
-    struct libinput_device *d = libinput_event_device_get_device(ev);
+                                  struct libinput_event *ev) {
+    struct libinput_device *d = libinput_event_get_device(ev);
     struct isz_seat_device *sd = libinput_device_get_user_data(d);
     if (!sd)
         return;
@@ -373,12 +410,10 @@ void isz_input_dispatch(isz_server *srv) {
             break;
         }
         case LIBINPUT_EVENT_DEVICE_ADDED:
-            handle_device_added(srv,
-                libinput_event_get_device_event(ev));
+            handle_device_added(srv, ev);
             break;
         case LIBINPUT_EVENT_DEVICE_REMOVED:
-            handle_device_removed(srv,
-                libinput_event_get_device_event(ev));
+            handle_device_removed(srv, ev);
             break;
         default:
             break;
