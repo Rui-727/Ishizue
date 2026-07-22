@@ -245,19 +245,6 @@ ISZ_API isz_server *isz_init(enum isz_backend_type backend, void *backend_config
         goto fail_backend;
     }
 
-#ifdef ISHIZUE_HAVE_DRM
-    /* SPEC 3: on SESSION_INACTIVE the DRM backend drops master; on
-     * SESSION_ACTIVE it re-acquires and surfaces ISZ_ERR_DRM_MASTER
-     * via isz_backend_set_error if re-acquisition fails. The listener
-     * registry is initialized above, so registering here is safe. */
-    if (backend == ISZ_BACKEND_DRM) {
-        isz_add_listener(srv, ISZ_EVENT_SESSION_ACTIVE,
-                         isz_drm_session_active_listener, srv->backend);
-        isz_add_listener(srv, ISZ_EVENT_SESSION_INACTIVE,
-                         isz_drm_session_inactive_listener, srv->backend);
-    }
-#endif
-
     /* Thread pool (W2-C). NULL on failure or when ENABLE_THREAD_POOL=0;
      * isz_thread_pool_submit returns -1 in that case. The pool is
      * optional, so failure to allocate is non-fatal; we log and move

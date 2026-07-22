@@ -53,6 +53,28 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Drop every entry on st->in_flight_releases without delivering
+ * ISZ_MSG_RELEASE. Used on VT resume (bug 9) and at backend destroy:
+ * the page-flip event that would normally clear each entry never fires
+ * because the CRTC was disabled by the VT switch (or because the
+ * backend is going away). Each entry holds one ref; we drop it here.
+ * The buffer's release_pending flag is cleared so a later
+ * isz_buffer_unref on the cache's ref does not try to unlink the node
+ * from a list it is no longer on. */
+void isz_drm_drop_inflight_releases(struct isz_drm_state *st)
+{
+    if (!st)
+        return;
+    isz_list_node *node;
+    while ((node = isz_list_pop_front(&st->in_flight_releases)) != NULL) {
+        struct isz_buffer *buf =
+            container_of(node, struct isz_buffer, release_node);
+        buf->release_pending = false;
+        isz_buffer_release(buf);
+        isz_buffer_unref(buf);
+    }
+}
+
 /* Page-flip event handler. drmHandleEvent calls this when the kernel
  * finishes scanning out the previous frame. The state machine was left
  * at COMMITTING by ops->commit; transition back to READY here.
