@@ -29,8 +29,9 @@
  *
  *   - opens the primary DRM node via libseat (or ISZ_DRM_NODE env, or
  *     /dev/dri/card0 as a last-resort direct open)
- *   - calls drmSetMaster and fails fast with ISZ_ERR_DRM_MASTER on
- *     EBUSY / EPERM (SPEC 3)
+ *   - calls drmSetMaster on the direct-open path and fails fast with
+ *     ISZ_ERR_DRM_MASTER on EBUSY / EPERM (SPEC 3); skips the call
+ *     when libseat opened the fd (already master, EINVAL otherwise)
  *   - verifies DRM_CLIENT_CAP_ATOMIC and fails fast with a clear
  *     error if atomic KMS is unavailable (SPEC 3: "atomic KMS only,
  *     hard requirement, not a fallback path")
@@ -169,6 +170,11 @@ int isz_output_get_drm_fd(isz_output *out)
 #include <sys/ioctl.h>
 #include <sys/vt.h>
 #include <sys/kd.h>
+/* <linux/kd.h> is where KD_GRAPHICS, KD_TEXT, K_OFF, and K_UNICODE
+ * are actually defined. glibc's <sys/kd.h> pulls it in transitively,
+ * but we include it explicitly so the dependency is visible at the
+ * call site (KDSETMODE/KDSKBMODE in setup_vt_signals). */
+#include <linux/kd.h>
 
 /* ------------------------------------------------------------------ */
 /* Backend-private state                                              */
@@ -204,16 +210,62 @@ static void on_vt_switch_back(int sig) {
 }
 
 static int setup_vt_signals(struct isz_drm_state *st) {
-    /* Open the current VT. */
-    st->vt_fd = open("/dev/tty", O_RDWR | O_NOCTTY);
-    if (st->vt_fd < 0) {
-        /* Try /dev/tty0 as fallback. */
-        st->vt_fd = open("/dev/tty0", O_RDWR);
+    /* Open the active VT by number, not /dev/tty. /dev/tty is the
+     * controlling TTY, which may not be a VT at all when running under
+     * SSH or as a daemon. The reliable pattern (Weston launcher-direct,
+     * Xorg lnx_init.c) is VT_GETSTATE on /dev/tty0 to discover the
+     * active VT number, then open /dev/ttyN for that specific N. */
+    int ctl_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
+    if (ctl_fd < 0) {
+        isz_log_internal(ISZ_LOG_WARN,
+                         "drm: cannot open /dev/tty0: %s", strerror(errno));
+        return -1;
     }
+    struct vt_stat vs;
+    memset(&vs, 0, sizeof(vs));
+    if (ioctl(ctl_fd, VT_GETSTATE, &vs) < 0) {
+        isz_log_internal(ISZ_LOG_WARN,
+                         "drm: VT_GETSTATE failed: %s", strerror(errno));
+        close(ctl_fd);
+        return -1;
+    }
+    int active = vs.v_active;
+    close(ctl_fd);
+
+    char vt_path[32];
+    int rc = snprintf(vt_path, sizeof(vt_path), "/dev/tty%d", active);
+    if (rc <= 0 || rc >= (int)sizeof(vt_path)) {
+        isz_log_internal(ISZ_LOG_WARN,
+                         "drm: VT number %d out of range", active);
+        return -1;
+    }
+    st->vt_fd = open(vt_path, O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (st->vt_fd < 0) {
         isz_log_internal(ISZ_LOG_WARN,
-                         "drm: cannot open VT fd: %s", strerror(errno));
+                         "drm: cannot open %s: %s", vt_path, strerror(errno));
         return -1;
+    }
+
+    /* Switch the VT into graphics mode so the kernel stops rendering
+     * text onto the scanout. Without KDSETMODE(KD_GRAPHICS) the user
+     * sees the DRM output and the text console overlaid. Weston,
+     * Xorg, and seatd all set this. */
+    if (ioctl(st->vt_fd, KDSETMODE, KD_GRAPHICS) < 0) {
+        isz_log_internal(ISZ_LOG_WARN,
+                         "drm: KDSETMODE(KD_GRAPHICS) failed: %s",
+                         strerror(errno));
+        /* Continue: the modeset will still blank the console. */
+    }
+
+    /* Disable kernel-processed keyboard input on the VT. Without
+     * KDSKBMODE(K_OFF) the keyboard sends both kernel-processed input
+     * (to the text VT) and libinput events, so every keypress doubles.
+     * K_OFF (vs. K_RAW) keeps the keyboard state sane for the next VT
+     * owner. */
+    if (ioctl(st->vt_fd, KDSKBMODE, K_OFF) < 0) {
+        isz_log_internal(ISZ_LOG_WARN,
+                         "drm: KDSKBMODE(K_OFF) failed: %s",
+                         strerror(errno));
     }
 
     /* Set VT mode to VT_PROCESS so the kernel sends SIGUSR1/SIGUSR2
@@ -247,8 +299,92 @@ static int setup_vt_signals(struct isz_drm_state *st) {
     sigaction(SIGUSR2, &sa, NULL);
 
     isz_log_internal(ISZ_LOG_INFO,
-                     "drm: VT signals installed (SIGUSR1/SIGUSR2)");
+                     "drm: VT signals installed on %s (SIGUSR1/SIGUSR2)",
+                     vt_path);
     return 0;
+}
+
+/* Drop every entry on st->in_flight_releases without delivering
+ * ISZ_MSG_RELEASE. Defined in isz_drm_event.c; declared here so the
+ * VT-resume path and the destroy path can share it. The header
+ * isz_drm_event.h only exposes isz_drm_event_dispatch, so this is a
+ * TU-local forward declaration. */
+extern void isz_drm_drop_inflight_releases(struct isz_drm_state *st);
+
+/* Bug 8: libinput holds evdev fds that the kernel revokes during a VT
+ * switch (libseat path) or that go stale while we are not master
+ * (direct VT path). libinput_suspend closes them; libinput_resume
+ * re-opens them via the open_restricted callback. Without this pair,
+ * input stops working after one VT switch. Mirrors wlroots
+ * backend/libinput/backend.c:185-189 and Aquamarine Session.cpp:82-83,
+ * 90-91. */
+static void drm_suspend_input(struct isz_drm_state *st)
+{
+    if (!st || !st->srv)
+        return;
+#ifdef ISHIZUE_HAVE_LIBINPUT
+    struct isz_input_state *istate = isz_server_get_input_state(st->srv);
+    if (istate && istate->li)
+        libinput_suspend(istate->li);
+#else
+    /* libinput not built in; nothing to suspend. */
+#endif
+}
+
+/* Bug 8 + 9 + 10 resume sequence. Called after drmSetMaster succeeds
+ * on either the direct VT path (vt_dispatch SIGUSR2 branch) or the
+ * libseat path (drm_enable_seat).
+ *
+ *   1. libinput_resume: re-open evdev fds the kernel revoked.
+ *   2. isz_backend_finish_commit: a commit that was in flight when
+ *      the VT switch hit will never get its page-flip event (the
+ *      CRTC was disabled). Transition COMMITTING -> READY so the next
+ *      commit is not rejected with ISZ_ERR_COMMIT_PENDING. Safe no-op
+ *      when the state is already READY.
+ *   3. isz_drm_drop_inflight_releases: same reason, but for the
+ *      per-buffer refs on st->in_flight_releases.
+ *   4. Re-commit each enabled DRM output. The CRTC was disabled by
+ *      the new VT owner (or by drmDropMaster); without this, the
+ *      screen stays black on switch back. Mirrors wlroots
+ *      backend/drm/backend.c:107-122 and Aquamarine DRM.cpp:423-470. */
+static void drm_resume_after_vt(struct isz_drm_state *st)
+{
+    if (!st || !st->backend)
+        return;
+
+#ifdef ISHIZUE_HAVE_LIBINPUT
+    if (st->srv) {
+        struct isz_input_state *istate = isz_server_get_input_state(st->srv);
+        if (istate && istate->li) {
+            if (libinput_resume(istate->li) != 0) {
+                isz_log_internal(ISZ_LOG_WARN,
+                                 "drm: libinput_resume failed on VT resume");
+            }
+        }
+    }
+#endif
+
+    isz_backend_finish_commit(st->backend);
+    isz_drm_drop_inflight_releases(st);
+
+    if (!st->srv)
+        return;
+
+    size_t n = 0;
+    isz_output **outs = isz_output_list(st->srv, &n);
+    if (!outs || n == 0)
+        return;
+    for (size_t i = 0; i < n; i++) {
+        isz_output *out = outs[i];
+        if (!out || !out->is_drm || !out->enabled)
+            continue;
+        int rc = isz_commit(out, ISZ_COMMIT_NORMAL);
+        if (rc < 0) {
+            isz_log_internal(ISZ_LOG_WARN,
+                             "drm: re-commit output %s after VT resume rc=%d",
+                             out->name, rc);
+        }
+    }
 }
 
 static void vt_dispatch(struct isz_drm_state *st) {
@@ -258,6 +394,7 @@ static void vt_dispatch(struct isz_drm_state *st) {
     if (g_vt_switch_away && st->is_master) {
         isz_log_internal(ISZ_LOG_INFO,
                          "drm: VT switch away, dropping master");
+        drm_suspend_input(st);
         drmDropMaster(st->drm_fd);
         st->is_master = false;
         st->session_active = false;
@@ -265,12 +402,27 @@ static void vt_dispatch(struct isz_drm_state *st) {
          * MUST be called AFTER drmDropMaster: the kernel requires
          * DRM_IOCTL_DROP_MASTER before VT_RELDISP. */
         ioctl(st->vt_fd, VT_RELDISP, 1);
+        /* Emit SESSION_INACTIVE. On the direct-VT path there is no
+         * libseat seat callback to emit it, so we emit here. The
+         * Architect listens for this to pause rendering. */
+        if (st->srv) {
+            isz_event ev = { .type = ISZ_EVENT_SESSION_INACTIVE };
+            isz_server_emit_event(st->srv, &ev);
+        }
     } else if (!g_vt_switch_away && !st->is_master) {
         isz_log_internal(ISZ_LOG_INFO,
                          "drm: VT switch back, acquiring master");
         if (drmSetMaster(st->drm_fd) == 0) {
             st->is_master = true;
             st->session_active = true;
+            drm_resume_after_vt(st);
+            /* Emit SESSION_ACTIVE only on a successful re-acquire.
+             * If drmSetMaster failed, the compositor is not master
+             * and the Architect should not resume rendering. */
+            if (st->srv) {
+                isz_event ev = { .type = ISZ_EVENT_SESSION_ACTIVE };
+                isz_server_emit_event(st->srv, &ev);
+            }
         } else {
             isz_log_internal(ISZ_LOG_ERROR,
                              "drm: drmSetMaster on VT return failed: %s",
@@ -296,11 +448,24 @@ void isz_drm_vt_dispatch(struct isz_backend *b) {
 
 static void teardown_vt_signals(struct isz_drm_state *st) {
     if (st->vt_fd >= 0) {
-        /* Restore auto VT mode. */
+        /* Restore VT_PROCESS -> VT_AUTO before restoring the keyboard
+         * and display modes: the kernel only honours KDSETMODE /
+         * KDSKBMODE on the controlling VT, and VT_AUTO is the safe
+         * default for hand-off. Order matters when running on a real
+         * TTY: VT_SETMODE first stops the SIGUSR1/SIGUSR2 flow. */
         struct vt_mode mode;
         memset(&mode, 0, sizeof(mode));
         mode.mode = VT_AUTO;
         ioctl(st->vt_fd, VT_SETMODE, &mode);
+
+        /* Undo KDSKBMODE(K_OFF). K_UNICODE is the kernel default and
+         * matches what a normal login getty expects. */
+        ioctl(st->vt_fd, KDSKBMODE, K_UNICODE);
+
+        /* Undo KDSETMODE(KD_GRAPHICS) so the text console is visible
+         * again after teardown. */
+        ioctl(st->vt_fd, KDSETMODE, KD_TEXT);
+
         close(st->vt_fd);
         st->vt_fd = -1;
     }
@@ -634,14 +799,18 @@ void isz_drm_rescan_connectors(struct isz_drm_state *st)
 static int open_drm_via_libseat(struct isz_drm_state *st,
                                 const char *device_path)
 {
-    /* libseat_open_device takes a path and returns a fd managed by the
-     * session. The seat handle was set up by the input/session layer;
-     * for the DRM backend we open our own seat here to keep the
-     * backend self-contained. */
-    (void)device_path;
-    if (st->seat)
-        return libseat_open_device(st->seat, device_path, NULL);
-    return -1;
+    /* libseat_open_device returns a device_id (>= 0) on success
+     * and writes the fd to the third argument. It does NOT return
+     * the fd itself. Passing NULL as the third arg causes a
+     * segfault because libseat writes the fd to *fd. */
+    if (!st->seat || !device_path)
+        return -1;
+    int fd = -1;
+    int dev_id = libseat_open_device(st->seat, device_path, &fd);
+    if (dev_id < 0 || fd < 0)
+        return -1;
+    /* TODO: store dev_id so we can libseat_close_device on teardown. */
+    return fd;
 }
 #endif
 
@@ -690,41 +859,56 @@ static int open_primary_drm_node(struct isz_drm_state *st)
 /* ------------------------------------------------------------------ */
 
 #ifdef ISHIZUE_HAVE_LIBSEAT
-/* libseat seat listener. disable_seat fires when the kernel requests
- * a VT switch (another TTY is activated). We must call drmDropMaster
- * here so the kernel releases the CRTC for the new VT. enable_seat
- * fires on switch-back; we re-acquire master.
+/* libseat seat listener. disable_seat fires when the seatd daemon has
+ * already dropped DRM master on its fd (which shares the same struct
+ * file as our drm_fd) and is telling us the VT is switching away.
+ * enable_seat fires after the daemon re-acquired master on switch-back.
  *
- * Without these callbacks the kernel blocks VT switches because DRM
- * master is still held. The user sees tinyisz frozen on the TTY
- * until Ctrl+C kills it. */
+ * The compositor must NOT call drmDropMaster / drmSetMaster here: the
+ * daemon already did it on its side of the shared file descriptor, so
+ * a second call from us returns EINVAL (not master / already master)
+ * and logs noise. wlroots and Aquamarine do not call drmSetMaster /
+ * drmDropMaster in their seat callbacks either.
+ *
+ * What we do here: flip session_active / is_master to mirror the
+ * daemon's state, acknowledge the switch so the kernel proceeds, and
+ * emit ISZ_EVENT_SESSION_INACTIVE / _ACTIVE so the Architect can pause
+ * and resume rendering. */
 static void drm_disable_seat(struct libseat *seat, void *userdata) {
     (void)seat;
     struct isz_drm_state *st = userdata;
     if (!st || !st->seat || st->drm_fd < 0) return;
     st->session_active = false;
-    isz_log_internal(ISZ_LOG_INFO, "drm: VT switch away, dropping master");
-    if (drmDropMaster(st->drm_fd) != 0) {
-        isz_log_internal(ISZ_LOG_WARN, "drm: drmDropMaster failed: %s",
-                         strerror(errno));
-    }
+    st->is_master = false;
+    isz_log_internal(ISZ_LOG_INFO, "drm: seat disabled (VT switch away)");
     /* Acknowledge the VT switch so the kernel can proceed. libseat
      * requires this; without it the switch hangs. */
     libseat_disable_seat(st->seat);
+    /* Emit SESSION_INACTIVE so the Architect can pause rendering. This
+     * is the primary emission path on the libseat seat callback; the
+     * DRM backend no longer registers its own listener for the event
+     * (W15-C: removed the duplicate listener from isz_lifecycle.c). */
+    if (st->srv) {
+        isz_event ev = { .type = ISZ_EVENT_SESSION_INACTIVE };
+        isz_server_emit_event(st->srv, &ev);
+    }
 }
 
 static void drm_enable_seat(struct libseat *seat, void *userdata) {
     (void)seat;
     struct isz_drm_state *st = userdata;
     if (!st || !st->seat || st->drm_fd < 0) return;
-    isz_log_internal(ISZ_LOG_INFO, "drm: VT switch back, acquiring master");
-    if (drmSetMaster(st->drm_fd) != 0) {
-        isz_log_internal(ISZ_LOG_ERROR, "drm: drmSetMaster failed: %s",
-                         strerror(errno));
-        isz_backend_set_error(st->backend, ISZ_ERR_DRM_MASTER);
-        return;
-    }
+    /* The daemon re-acquired master before sending SERVER_ENABLE_SEAT.
+     * If re-acquisition had failed, libseat would not have sent the
+     * enable callback, so we trust the state and do not call
+     * drmSetMaster ourselves. */
     st->session_active = true;
+    st->is_master = true;
+    isz_log_internal(ISZ_LOG_INFO, "drm: seat enabled (VT switch back)");
+    if (st->srv) {
+        isz_event ev = { .type = ISZ_EVENT_SESSION_ACTIVE };
+        isz_server_emit_event(st->srv, &ev);
+    }
 }
 
 static const struct libseat_seat_listener drm_seat_listener = {
@@ -775,8 +959,17 @@ static int isz_drm_init(struct isz_backend *self, void *config)
     st->drm_fd = fd;
     g_drm_state = st;
 
-    /* SPEC 3: acquire master, fail fast on EBUSY/EPERM. */
-    if (drmSetMaster(fd) != 0) {
+    /* SPEC 3: acquire master, fail fast on EBUSY/EPERM.
+     *
+     * Only call drmSetMaster on the direct-open path (st->seat == NULL).
+     * When libseat opens the DRM fd, the fd shares the kernel struct
+     * file with seatd's fd and is already master. drmSetMaster on an
+     * already-master fd returns EINVAL, which we previously treated as
+     * fatal. wlroots and Aquamarine never call drmSetMaster at all when
+     * running under libseat. */
+    if (st->seat) {
+        st->is_master = true;
+    } else if (drmSetMaster(fd) != 0) {
         int saved = errno;
         isz_log_internal(ISZ_LOG_ERROR,
                          "drm init: drmSetMaster failed errno=%d (%s)",
@@ -788,8 +981,9 @@ static int isz_drm_init(struct isz_backend *self, void *config)
         free(st);
         self->impl = NULL;
         return ISZ_ERR_DRM_MASTER;
+    } else {
+        st->is_master = true;
     }
-    st->is_master = true;
 
     /* Set up VT switching. If libseat is available and working, it
      * handles VT switches via disable_seat/enable_seat callbacks.
