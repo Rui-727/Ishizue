@@ -337,11 +337,16 @@ ISZ_API void isz_dispatch(isz_server *srv)
                 }
                 break;
             case ISZ_FD_SEAT:
-                /* libseat session fd: drain the session so
-                 * enable_seat / disable_seat fire. disable_seat
-                 * calls drmDropMaster so the kernel can complete
-                 * the VT switch. Without this the switch hangs. */
-                isz_session_dispatch(srv);
+                /* DRM backend's libseat session fd: dispatch the
+                 * DRM backend's seat, not the input layer's session.
+                 * isz_backend_read_events calls isz_drm_read_events
+                 * which calls libseat_dispatch on st->seat (the DRM
+                 * backend's session). This fires disable_seat/
+                 * enable_seat callbacks for VT switching.
+                 *
+                 * Do NOT call isz_session_dispatch here: that
+                 * dispatches a DIFFERENT libseat session (the input
+                 * layer's), leaving the DRM session undrained. */
                 if (srv->backend) {
                     (void)isz_backend_read_events(srv->backend);
                 }
