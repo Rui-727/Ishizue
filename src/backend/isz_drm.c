@@ -261,7 +261,9 @@ static void vt_dispatch(struct isz_drm_state *st) {
         drmDropMaster(st->drm_fd);
         st->is_master = false;
         st->session_active = false;
-        /* Acknowledge the switch so the kernel proceeds. */
+        /* Acknowledge the switch so the kernel proceeds.
+         * MUST be called AFTER drmDropMaster: the kernel requires
+         * DRM_IOCTL_DROP_MASTER before VT_RELDISP. */
         ioctl(st->vt_fd, VT_RELDISP, 1);
     } else if (!g_vt_switch_away && !st->is_master) {
         isz_log_internal(ISZ_LOG_INFO,
@@ -277,6 +279,19 @@ static void vt_dispatch(struct isz_drm_state *st) {
         /* Acknowledge the switch back. */
         ioctl(st->vt_fd, VT_RELDISP, 2);
     }
+}
+
+/* Public wrapper so isz_dispatch can call vt_dispatch on every
+ * iteration. The signal handler sets g_vt_switch_away; this function
+ * checks it and drops/acquires master. Without calling this on every
+ * dispatch tick, the SIGUSR1 flag is never checked (epoll_wait returns
+ * EINTR but no fd is ready, so isz_drm_read_events is never reached). */
+void isz_drm_vt_dispatch(struct isz_backend *b) {
+    if (!b || !b->impl)
+        return;
+    struct isz_drm_state *st = b->impl;
+    if (st->drm_fd >= 0)
+        vt_dispatch(st);
 }
 
 static void teardown_vt_signals(struct isz_drm_state *st) {

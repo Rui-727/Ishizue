@@ -211,6 +211,13 @@ int  isz_drm_get_vt_fd(struct isz_backend *b);
 const struct isz_drm_connector *isz_drm_get_connectors(struct isz_backend *b,
                                                        size_t *n);
 
+/* Check for pending VT switch signals (SIGUSR1/SIGUSR2) and
+ * drop/acquire DRM master accordingly. Must be called on every
+ * dispatch iteration, not just when the DRM fd has events.
+ * The signal handler sets a flag; this function checks it.
+ * No-op when libseat is handling VT switching (vt_fd < 0). */
+void isz_drm_vt_dispatch(struct isz_backend *b);
+
 /* Hotplug rescan. Re-reads the connector list, fires the output hook
  * for any newly-appeared or disappeared connectors. Exposed here so
  * isz_drm_event.c can drive it from the page-flip / hotplug path. */

@@ -375,6 +375,18 @@ ISZ_API void isz_dispatch(isz_server *srv)
     isz_session_dispatch(srv);
     isz_input_dispatch(srv);
 
+    /* VT switch handling: check the SIGUSR1/SIGUSR2 flags on every
+     * dispatch iteration. The signal handler sets g_vt_switch_away;
+     * isz_drm_vt_dispatch checks it and calls drmDropMaster +
+     * VT_RELDISP(1) to acknowledge the switch. Without this the flag
+     * is never checked because epoll_wait returns EINTR (no fd ready)
+     * and isz_drm_read_events is never called. */
+#ifdef ISHIZUE_HAVE_DRM
+    if (srv->backend && srv->backend->type == ISZ_BACKEND_DRM) {
+        isz_drm_vt_dispatch(srv->backend);
+    }
+#endif
+
     /* W5-B: drain any pending explicit-sync buffer releases. No-op
      * without ISHIZUE_HAVE_DRM (no syncobj is ever attached to a
      * buffer, so the pending list stays empty). */
