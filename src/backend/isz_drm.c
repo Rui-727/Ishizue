@@ -161,9 +161,14 @@ int isz_output_get_drm_fd(isz_output *out)
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <sys/vt.h>
+#include <sys/kd.h>
 
 /* ------------------------------------------------------------------ */
 /* Backend-private state                                              */
@@ -173,6 +178,121 @@ int isz_output_get_drm_fd(isz_output *out)
  * threading it through the buffer API. The DRM backend is a
  * singleton per server; single-threaded per SPEC 5, so no lock. */
 static struct isz_drm_state *g_drm_state;
+
+/* Direct VT handling (fallback when libseat is unavailable).
+ *
+ * The kernel sends SIGUSR1 when another VT is requested and
+ * SIGUSR2 when switching back. We must:
+ *   SIGUSR1: drmDropMaster + ioctl(VT_RELDISP, 1) to ack
+ *   SIGUSR2: drmSetMaster + ioctl(VT_RELDISP, 2) to ack
+ *
+ * Without VT_RELDISP the kernel blocks the switch.
+ * Without drmDropMaster the CRTC stays locked.
+ *
+ * This mirrors what weston does in libweston/compositor.c
+ * when running without logind. */
+static volatile sig_atomic_t g_vt_switch_away = 0;
+
+static void on_vt_switch_away(int sig) {
+    (void)sig;
+    g_vt_switch_away = 1;
+}
+
+static void on_vt_switch_back(int sig) {
+    (void)sig;
+    g_vt_switch_away = 0;
+}
+
+static int setup_vt_signals(struct isz_drm_state *st) {
+    /* Open the current VT. */
+    st->vt_fd = open("/dev/tty", O_RDWR | O_NOCTTY);
+    if (st->vt_fd < 0) {
+        /* Try /dev/tty0 as fallback. */
+        st->vt_fd = open("/dev/tty0", O_RDWR);
+    }
+    if (st->vt_fd < 0) {
+        isz_log_internal(ISZ_LOG_WARN,
+                         "drm: cannot open VT fd: %s", strerror(errno));
+        return -1;
+    }
+
+    /* Set VT mode to VT_PROCESS so the kernel sends SIGUSR1/SIGUSR2
+     * instead of auto-switching. relsig = SIGUSR1 (switch away),
+     * acqsig = SIGUSR2 (switch back). */
+    struct vt_mode mode;
+    memset(&mode, 0, sizeof(mode));
+    mode.mode = VT_PROCESS;
+    mode.relsig = SIGUSR1;
+    mode.acqsig = SIGUSR2;
+    if (ioctl(st->vt_fd, VT_SETMODE, &mode) < 0) {
+        isz_log_internal(ISZ_LOG_WARN,
+                         "drm: VT_SETMODE failed: %s", strerror(errno));
+        close(st->vt_fd);
+        st->vt_fd = -1;
+        return -1;
+    }
+
+    /* Install signal handlers. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_vt_switch_away;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_vt_switch_back;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGUSR2, &sa, NULL);
+
+    isz_log_internal(ISZ_LOG_INFO,
+                     "drm: VT signals installed (SIGUSR1/SIGUSR2)");
+    return 0;
+}
+
+static void vt_dispatch(struct isz_drm_state *st) {
+    if (st->vt_fd < 0)
+        return;
+
+    if (g_vt_switch_away && st->is_master) {
+        isz_log_internal(ISZ_LOG_INFO,
+                         "drm: VT switch away, dropping master");
+        drmDropMaster(st->drm_fd);
+        st->is_master = false;
+        st->session_active = false;
+        /* Acknowledge the switch so the kernel proceeds. */
+        ioctl(st->vt_fd, VT_RELDISP, 1);
+    } else if (!g_vt_switch_away && !st->is_master) {
+        isz_log_internal(ISZ_LOG_INFO,
+                         "drm: VT switch back, acquiring master");
+        if (drmSetMaster(st->drm_fd) == 0) {
+            st->is_master = true;
+            st->session_active = true;
+        } else {
+            isz_log_internal(ISZ_LOG_ERROR,
+                             "drm: drmSetMaster on VT return failed: %s",
+                             strerror(errno));
+        }
+        /* Acknowledge the switch back. */
+        ioctl(st->vt_fd, VT_RELDISP, 2);
+    }
+}
+
+static void teardown_vt_signals(struct isz_drm_state *st) {
+    if (st->vt_fd >= 0) {
+        /* Restore auto VT mode. */
+        struct vt_mode mode;
+        memset(&mode, 0, sizeof(mode));
+        mode.mode = VT_AUTO;
+        ioctl(st->vt_fd, VT_SETMODE, &mode);
+        close(st->vt_fd);
+        st->vt_fd = -1;
+    }
+    /* Restore default signal handlers. */
+    signal(SIGUSR1, SIG_DFL);
+    signal(SIGUSR2, SIG_DFL);
+}
 
 /* ------------------------------------------------------------------ */
 /* Render-node enumeration (SPEC 10)                                  */
@@ -656,6 +776,18 @@ static int isz_drm_init(struct isz_backend *self, void *config)
     }
     st->is_master = true;
 
+    /* Set up VT switching. If libseat is available and working, it
+     * handles VT switches via disable_seat/enable_seat callbacks.
+     * If libseat is unavailable (no seatd daemon, no logind), we
+     * install direct SIGUSR1/SIGUSR2 handlers so the kernel can
+     * signal us to drop/acquire master on VT switch.
+     *
+     * Without this, the kernel blocks VT switches because DRM
+     * master is held and never released. The user gets stuck. */
+    if (!st->seat) {
+        setup_vt_signals(st);
+    }
+
     /* SPEC 3: atomic KMS is a hard requirement. */
     if (drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0) {
         isz_log_internal(ISZ_LOG_ERROR,
@@ -765,8 +897,7 @@ static int isz_drm_read_events(struct isz_backend *self)
 
     /* Drain the libseat session. enable_seat / disable_seat fire
      * inline here, triggering drmDropMaster / drmSetMaster on VT
-     * switches. Without this the seat fd is never drained and VT
-     * switches hang. */
+     * switches. */
 #ifdef ISHIZUE_HAVE_LIBSEAT
     if (st->seat) {
         while (libseat_dispatch(st->seat, 0) > 0) {
@@ -774,6 +905,12 @@ static int isz_drm_read_events(struct isz_backend *self)
         }
     }
 #endif
+
+    /* Direct VT handling: if libseat is unavailable, check the
+     * SIGUSR1/SIGUSR2 flags set by the signal handlers and
+     * drop/acquire master accordingly. vt_dispatch is a no-op
+     * when vt_fd < 0 (libseat is handling it). */
+    vt_dispatch(st);
 
     return isz_drm_event_dispatch(st, self);
 }
@@ -825,6 +962,9 @@ static void isz_drm_destroy(struct isz_backend *self)
         st->seat = NULL;
     }
 #endif
+
+    /* Restore VT auto mode and default signal handlers. */
+    teardown_vt_signals(st);
 
     free(st);
     self->impl = NULL;
