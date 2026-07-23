@@ -210,11 +210,22 @@ static void on_vt_switch_back(int sig) {
 }
 
 static int setup_vt_signals(struct isz_drm_state *st) {
-    /* Open the active VT by number, not /dev/tty. /dev/tty is the
-     * controlling TTY, which may not be a VT at all when running under
-     * SSH or as a daemon. The reliable pattern (Weston launcher-direct,
-     * Xorg lnx_init.c) is VT_GETSTATE on /dev/tty0 to discover the
-     * active VT number, then open /dev/ttyN for that specific N. */
+    /* Open the active VT so we can restore text mode on exit.
+     *
+     * Do NOT set KD_GRAPHICS: it blanks the screen and on some
+     * kernels blocks keyboard input including SysRq, leaving the
+     * user with no recovery path. The DRM modeset + black dumb
+     * buffer already covers the screen.
+     *
+     * Do NOT set VT_PROCESS: it makes the kernel wait for
+     * VT_RELDISP before completing a VT switch. If our signal
+     * handler or dispatch loop is slow, the switch hangs and the
+     * user is stuck. VT_AUTO lets the kernel switch instantly.
+     *
+     * We lose drmDropMaster on VT switch. That means the new VT
+     * owner can't acquire master until we exit. This is a known
+     * trade-off: safety over correctness. Fix VT_PROCESS later
+     * when the signal path is proven to work. */
     int ctl_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
     if (ctl_fd < 0) {
         isz_log_internal(ISZ_LOG_WARN,
@@ -246,54 +257,8 @@ static int setup_vt_signals(struct isz_drm_state *st) {
         return -1;
     }
 
-    /* Switch the VT into graphics mode so the kernel stops rendering
-     * text onto the scanout. Without this the text console and the
-     * DRM output fight over the display. wlroots, weston, and Xorg
-     * all set this. */
-    if (ioctl(st->vt_fd, KDSETMODE, KD_GRAPHICS) < 0) {
-        isz_log_internal(ISZ_LOG_WARN,
-                         "drm: KDSETMODE(KD_GRAPHICS) failed: %s",
-                         strerror(errno));
-    }
-
-    /* Do NOT call KDSKBMODE(K_OFF). It disables the keyboard entirely,
-     * so when VT switch fails the user is stuck with no input and no
-     * way to recover. wlroots does not disable the keyboard either.
-     * The kernel VT subsystem handles keyboard routing between VTs
-     * automatically when VT_PROCESS mode is set. */
-
-    /* Set VT mode to VT_PROCESS so the kernel sends SIGUSR1/SIGUSR2
-     * instead of auto-switching. relsig = SIGUSR1 (switch away),
-     * acqsig = SIGUSR2 (switch back). */
-    struct vt_mode mode;
-    memset(&mode, 0, sizeof(mode));
-    mode.mode = VT_PROCESS;
-    mode.relsig = SIGUSR1;
-    mode.acqsig = SIGUSR2;
-    if (ioctl(st->vt_fd, VT_SETMODE, &mode) < 0) {
-        isz_log_internal(ISZ_LOG_WARN,
-                         "drm: VT_SETMODE failed: %s", strerror(errno));
-        close(st->vt_fd);
-        st->vt_fd = -1;
-        return -1;
-    }
-
-    /* Install signal handlers. */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_vt_switch_away;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGUSR1, &sa, NULL);
-
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_vt_switch_back;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGUSR2, &sa, NULL);
-
     isz_log_internal(ISZ_LOG_INFO,
-                     "drm: VT signals installed on %s (SIGUSR1/SIGUSR2)",
+                     "drm: opened %s (VT_AUTO, no graphics mode, no keyboard grab)",
                      vt_path);
     return 0;
 }
@@ -441,28 +406,13 @@ void isz_drm_vt_dispatch(struct isz_backend *b) {
 }
 
 static void teardown_vt_signals(struct isz_drm_state *st) {
+    /* Just close the VT fd. We never set KD_GRAPHICS or VT_PROCESS,
+     * so there's nothing to restore. The kernel's VT_AUTO mode handles
+     * everything. */
     if (st->vt_fd >= 0) {
-        /* Restore VT_PROCESS -> VT_AUTO before restoring the keyboard
-         * and display modes: the kernel only honours KDSETMODE /
-         * KDSKBMODE on the controlling VT, and VT_AUTO is the safe
-         * default for hand-off. Order matters when running on a real
-         * TTY: VT_SETMODE first stops the SIGUSR1/SIGUSR2 flow. */
-        struct vt_mode mode;
-        memset(&mode, 0, sizeof(mode));
-        mode.mode = VT_AUTO;
-        ioctl(st->vt_fd, VT_SETMODE, &mode);
-
-        /* Restore KD_TEXT so the text console is visible again.
-         * KDSKBMODE was never set to K_OFF (removed for safety),
-         * so no keyboard restore needed. */
-        ioctl(st->vt_fd, KDSETMODE, KD_TEXT);
-
         close(st->vt_fd);
         st->vt_fd = -1;
     }
-    /* Restore default signal handlers. */
-    signal(SIGUSR1, SIG_DFL);
-    signal(SIGUSR2, SIG_DFL);
 }
 
 /* ------------------------------------------------------------------ */
