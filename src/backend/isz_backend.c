@@ -46,9 +46,6 @@ struct isz_backend *isz_backend_create(enum isz_backend_type type, void *config)
     case ISZ_BACKEND_HEADLESS:
         ops = isz_headless_get_ops();
         break;
-    case ISZ_BACKEND_NESTED:
-        ops = isz_nested_get_ops();
-        break;
     default:
         isz_log_internal(ISZ_LOG_ERROR,
                          "isz_backend_create: unknown backend type %d", (int)type);
