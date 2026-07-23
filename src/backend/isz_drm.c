@@ -257,16 +257,11 @@ static int setup_vt_signals(struct isz_drm_state *st) {
         /* Continue: the modeset will still blank the console. */
     }
 
-    /* Disable kernel-processed keyboard input on the VT. Without
-     * KDSKBMODE(K_OFF) the keyboard sends both kernel-processed input
-     * (to the text VT) and libinput events, so every keypress doubles.
-     * K_OFF (vs. K_RAW) keeps the keyboard state sane for the next VT
-     * owner. */
-    if (ioctl(st->vt_fd, KDSKBMODE, K_OFF) < 0) {
-        isz_log_internal(ISZ_LOG_WARN,
-                         "drm: KDSKBMODE(K_OFF) failed: %s",
-                         strerror(errno));
-    }
+    /* Do NOT call KDSKBMODE(K_OFF). It disables the keyboard entirely,
+     * so when VT switch fails the user is stuck with no input and no
+     * way to recover. wlroots does not disable the keyboard either.
+     * The kernel VT subsystem handles keyboard routing between VTs
+     * automatically when VT_PROCESS mode is set. */
 
     /* Set VT mode to VT_PROCESS so the kernel sends SIGUSR1/SIGUSR2
      * instead of auto-switching. relsig = SIGUSR1 (switch away),
@@ -458,12 +453,9 @@ static void teardown_vt_signals(struct isz_drm_state *st) {
         mode.mode = VT_AUTO;
         ioctl(st->vt_fd, VT_SETMODE, &mode);
 
-        /* Undo KDSKBMODE(K_OFF). K_UNICODE is the kernel default and
-         * matches what a normal login getty expects. */
-        ioctl(st->vt_fd, KDSKBMODE, K_UNICODE);
-
-        /* Undo KDSETMODE(KD_GRAPHICS) so the text console is visible
-         * again after teardown. */
+        /* Restore KD_TEXT so the text console is visible again.
+         * KDSKBMODE was never set to K_OFF (removed for safety),
+         * so no keyboard restore needed. */
         ioctl(st->vt_fd, KDSETMODE, KD_TEXT);
 
         close(st->vt_fd);
