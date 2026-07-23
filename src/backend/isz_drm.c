@@ -247,14 +247,13 @@ static int setup_vt_signals(struct isz_drm_state *st) {
     }
 
     /* Switch the VT into graphics mode so the kernel stops rendering
-     * text onto the scanout. Without KDSETMODE(KD_GRAPHICS) the user
-     * sees the DRM output and the text console overlaid. Weston,
-     * Xorg, and seatd all set this. */
+     * text onto the scanout. Without this the text console and the
+     * DRM output fight over the display. wlroots, weston, and Xorg
+     * all set this. */
     if (ioctl(st->vt_fd, KDSETMODE, KD_GRAPHICS) < 0) {
         isz_log_internal(ISZ_LOG_WARN,
                          "drm: KDSETMODE(KD_GRAPHICS) failed: %s",
                          strerror(errno));
-        /* Continue: the modeset will still blank the console. */
     }
 
     /* Do NOT call KDSKBMODE(K_OFF). It disables the keyboard entirely,

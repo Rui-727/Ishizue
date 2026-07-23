@@ -235,8 +235,10 @@ int main(int argc, char **argv)
     isz_server *srv = isz_init(backend,
         (backend == ISZ_BACKEND_HEADLESS) ? &hcfg : NULL);
     if (!srv) { fprintf(stderr, "tinyisz: isz_init failed\n"); return 1; }
-    fprintf(stderr, "tinyisz: backend=%s %dx%d@%d\n",
-            backend_str, width, height, refresh_hz);
+    fprintf(stderr, "tinyisz: pid=%d backend=%s %dx%d@%d\n",
+            (int)getpid(), backend_str, width, height, refresh_hz);
+    fprintf(stderr, "tinyisz: to kill: kill -TERM %d (or kill -9 %d)\n",
+            (int)getpid(), (int)getpid());
 
     const char *bridge_path = bridge_flag;
     if (!bridge_path) {
@@ -318,8 +320,10 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "tinyisz: shutting down\n");
     kill(bridge_pid, SIGTERM);
-    for (int i = 0; i < 2000 && waitpid(bridge_pid, NULL, WNOHANG) != bridge_pid; i++)
+    /* Wait 1 second for bridge to exit cleanly. */
+    for (int i = 0; i < 1000 && waitpid(bridge_pid, NULL, WNOHANG) != bridge_pid; i++)
         usleep(1000);
+    /* Force kill if still alive. */
     kill(bridge_pid, SIGKILL);
     waitpid(bridge_pid, NULL, 0);
 
